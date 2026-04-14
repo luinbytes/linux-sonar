@@ -2757,7 +2757,17 @@ class MicEffectsPanel(Gtk.Box):
 # ---------------------------------------------------------------------------
 
 class StreamRow(Gtk.Box):
-    """One row in the app-routing panel: [icon] [app name]  [channel dropdown]"""
+    """One row in the app-routing panel: [⚠] [app name] [channel dropdown] [Route]
+
+    A stream is "orphan" when it's not linked to any Sonar channel AND the
+    user has no saved pref for it. Apps fall into this when they launch
+    with target.object empty and PipeWire drops them on the raw default
+    device — ChatMix and per-channel volume then have no effect.
+    Orphan rows are tinted amber, prefixed with ⚠, and get an explicit
+    Route button (DropDown.notify::selected doesn't fire for same-value
+    clicks, so the button is the way to commit to the currently-shown
+    channel without having to pick a different one first).
+    """
 
     def __init__(self, stream_ids: list[int], app_name: str, current_channel: str | None,
                  sonar_ids: dict[str, int | None],
@@ -2771,10 +2781,12 @@ class StreamRow(Gtk.Box):
         self._suppress = False
 
         # Priority: stored user pref → detected channel (WirePlumber already routed it)
-        # → role-based default (last resort when channel is unknown)
+        # → role-based default (only as a display hint — flagged as orphan).
+        self._is_orphan = False
         if routing_prefs and app_name in routing_prefs:
             current_channel = routing_prefs[app_name]
         elif current_channel is None:
+            self._is_orphan = True
             current_channel = default_channel(media_role)
 
         self.set_margin_top(4)
@@ -2782,12 +2794,21 @@ class StreamRow(Gtk.Box):
         self.set_margin_start(8)
         self.set_margin_end(8)
 
-        name_lbl = Gtk.Label(label=app_name)
+        display_name = f"⚠ {app_name}" if self._is_orphan else app_name
+        name_lbl = Gtk.Label(label=display_name)
         name_lbl.set_halign(Gtk.Align.START)
         name_lbl.set_hexpand(False)
         name_lbl.set_ellipsize(3)
-        name_lbl.set_max_width_chars(8)
+        name_lbl.set_max_width_chars(10 if self._is_orphan else 8)
         name_lbl.add_css_class("stream-name")
+        if self._is_orphan:
+            name_lbl.add_css_class("stream-name-orphan")
+            name_lbl.set_tooltip_text(
+                f"{app_name} is not routed to any Sonar channel.\n"
+                "It's playing through the raw default device, so ChatMix\n"
+                "and per-channel volume don't affect it. Pick a channel\n"
+                "(or click 'Route') to route it here."
+            )
         self.append(name_lbl)
 
         self._model = Gtk.StringList.new(CHANNELS)
@@ -2801,22 +2822,45 @@ class StreamRow(Gtk.Box):
         self._suppress = False
 
         self._apply_dropdown_color(CHANNELS[idx])
+        if self._is_orphan:
+            self._dropdown.add_css_class("orphan")
+
         self._dropdown.connect("notify::selected", self._on_channel_changed)
         self.append(self._dropdown)
+
+        self._route_btn: Gtk.Button | None = None
+        if self._is_orphan:
+            btn = Gtk.Button(label="Route")
+            btn.add_css_class("orphan-route-btn")
+            btn.set_tooltip_text("Route to the currently-shown channel")
+            btn.set_valign(Gtk.Align.CENTER)
+            btn.connect("clicked", self._on_route_clicked)
+            self.append(btn)
+            self._route_btn = btn
 
     def _apply_dropdown_color(self, channel: str) -> None:
         for cls in [f"ch-{c.lower()}" for c in CHANNELS]:
             self._dropdown.remove_css_class(cls)
         self._dropdown.add_css_class(f"ch-{channel.lower()}")
 
-    def _on_channel_changed(self, dropdown: Gtk.DropDown, _param) -> None:
-        if self._suppress:
-            return
-        channel = CHANNELS[dropdown.get_selected()]
+    def _apply_route(self, channel: str) -> None:
         self._apply_dropdown_color(channel)
         save_routing_pref(self._app_name, channel)
         for sid in self._stream_ids:
             move_stream(sid, channel)
+        if self._is_orphan:
+            self._is_orphan = False
+            self._dropdown.remove_css_class("orphan")
+            if self._route_btn is not None:
+                self._route_btn.set_visible(False)
+
+    def _on_channel_changed(self, dropdown: Gtk.DropDown, _param) -> None:
+        if self._suppress:
+            return
+        self._apply_route(CHANNELS[dropdown.get_selected()])
+
+    def _on_route_clicked(self, _btn) -> None:
+        self._apply_route(CHANNELS[self._dropdown.get_selected()])
 
 
 # ---------------------------------------------------------------------------
@@ -3293,6 +3337,31 @@ def _build_css() -> bytes:
         font-weight: bold;
         padding: 2px 4px;
         border-radius: 5px;
+    }}
+
+    /* Orphan stream row (stream not routed to any Sonar channel) */
+    .stream-name-orphan {{
+        color: #f59e0b;
+    }}
+    .channel-dropdown.orphan {{
+        outline: 1px solid alpha(#f59e0b, 0.6);
+        outline-offset: -1px;
+        background-color: alpha(#f59e0b, 0.12);
+    }}
+    .orphan-route-btn {{
+        font-size: x-small;
+        font-weight: bold;
+        padding: 1px 8px;
+        margin: 0 2px;
+        min-height: 0;
+        border-radius: 5px;
+        background-image: none;
+        background-color: alpha(#f59e0b, 0.18);
+        color: #f59e0b;
+        border: 1px solid alpha(#f59e0b, 0.5);
+    }}
+    .orphan-route-btn:hover {{
+        background-color: alpha(#f59e0b, 0.3);
     }}
 
     /* ChatMix horizontal slider */
