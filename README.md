@@ -1,37 +1,22 @@
 # linux-sonar
 
-A Linux equivalent of [SteelSeries Sonar](https://steelseries.com/gg/sonar) —
-per-app audio routing, ChatMix balance, and a studio-style mic effects
-chain — built on top of PipeWire and WirePlumber, with a GTK4/libadwaita GUI.
+SteelSeries Sonar for Linux. Per-app audio routing, ChatMix balance, and mic effects on PipeWire + WirePlumber with a GTK4/libadwaita GUI.
 
-Originally written for a **SteelSeries Arctis Nova 7** headset on Arch
-Linux (Hyprland), but the architecture is vendor-neutral: any PipeWire
-setup with a stereo output sink works — you just point the virtual channels
-at whatever `alsa_output.*` node you have.
+Built for the Arctis Nova 7 on Arch. Works with any PipeWire stereo output sink, just point the virtual channels at your `alsa_output.*` node.
 
-## What it does
+By [@luinbytes](https://github.com/luinbytes) · [Portfolio](https://luinbytes.github.io)
 
-- **Five virtual channels** (Game / Chat / Media / AUX / VoiceChat) that
-  each appear to apps as a regular audio sink. Per-channel volume + mute.
-- **Per-app routing** — drag an app to any channel in the GUI, or edit
-  `routing.json` directly. Routing preferences persist across reboots via
-  WirePlumber's state file.
-- **ChatMix** — a Game/Chat balance slider plus live hardware ChatMix wheel
-  support (on headsets that expose one over HID, like the Arctis Nova 7).
-- **Mic effects chain** — RNNoise (LADSPA) → Gate → 8-band EQ → Compressor
-  → Limiter, running as its own PipeWire filter-chain subprocess. Live
-  parameter updates are debounced and reloaded silently (fade out → restart
-  → fade back in) so the other side of a call hears no click.
-- **Live auto-tune** — a silent background worker that watches the mic
-  during silence and nudges gate threshold / compressor makeup / RNNoise
-  strength toward good baseline values. Completely optional, off by
-  default.
-- **Waybar integration** — two small JSON-output scripts: one showing all
-  five channels at once, one showing a single channel.
-- **Single-file Python app** — ~3500 lines, GTK4 + libadwaita, no build
-  step. Easy to audit and patch.
+## Features
 
-## How it works
+Five virtual channels (Game, Chat, Media, AUX, VoiceChat) each appear as a regular audio sink. Route apps to any channel via the GUI or `routing.json`. Volumes persist across reboots through WirePlumber state files.
+
+ChatMix slider maps to Game/Chat balance. Supports the Arctis Nova 7 hardware ChatMix wheel over USB-HID (~50 ms polling). The on-screen slider works with any headset.
+
+Mic effects chain: RNNoise (LADSPA) > Gate > 8-band EQ > Compressor > Limiter. Runs as its own PipeWire filter-chain subprocess. Parameter changes debounce for 600 ms, then fade out, restart, fade back in. No clicks on the other end. Optional live auto-tune watches mic levels during silence and nudges gate threshold, compressor makeup, and RNNoise strength toward sane defaults.
+
+Waybar integration included. Single-file Python app, ~3500 lines, no build step.
+
+## Architecture
 
 ```
                           ┌──────────────────────────────────┐
@@ -56,54 +41,23 @@ at whatever `alsa_output.*` node you have.
                        └─► restarts sonar-mic-filterchain.service on change
 ```
 
-- **Virtual sinks** are 5 `libpipewire-module-filter-chain` blocks in
-  `config/pipewire/10-sonar-sinks.conf`. Each is a passthrough filter
-  whose `playback.props.target.object` is pinned to the Arctis output
-  node, so anything routed into `Sonar_Game` ends up on the headset.
-- **Per-app routing** is enforced in userspace by the `sonar-mixer
-  --daemon` process, which polls `wpctl status` + `pactl list sink-inputs`
-  every ~1.5 s and runs `pactl move-sink-input` on any stream whose
-  preferred channel (from `routing.json`) doesn't match its current sink.
-  WirePlumber's state file persists the move, so after the first route,
-  subsequent app starts land on the correct sink without the daemon
-  having to do anything.
-- **Mic path**: the headset's raw mic feeds a separate
-  `sonar-mic-filterchain.service` — an isolated `pipewire` subprocess
-  running a filter-chain config generated from `mic-effects.json`. The
-  chain is RNNoise (LADSPA) → Calf Gate → Calf Equalizer8Band → Calf
-  Compressor → Calf Limiter, with any subset of stages enabled. The GUI
-  debounces slider changes (~600 ms) and does a silent restart of this
-  service: fade `Sonar_Mic` volume to 0, restart the subprocess, mute
-  the new node as soon as it appears, 80 ms settle, fade back up.
-- **ChatMix HID** (optional): reads the Arctis Nova 7's ChatMix wheel
-  over USB-HID and mixes it into the Game/Chat channel volumes at
-  ~50 ms intervals.
+Virtual sinks are five `libpipewire-module-filter-chain` blocks in `config/pipewire/10-sonar-sinks.conf`. Each passes through to the headset via `target.object`.
 
-## Hardware
+Per-app routing runs in `sonar-mixer --daemon`. Polls `wpctl status` + `pactl list sink-inputs` every ~1.5 s and moves streams whose preferred channel doesn't match their current sink. WirePlumber persists the move after the first route.
 
-Everything in this repo is **hardcoded for the SteelSeries Arctis Nova 7**:
-
-- `config/pipewire/10-sonar-sinks.conf` pins every channel to
-  `alsa_output.usb-SteelSeries_Arctis_Nova_7-00.analog-stereo`.
-- `config/wireplumber/50-sonar-routing.conf` disables suspend timeout on
-  the same node.
-- `sonar-mixer` knows how to talk to the Arctis Nova 7 ChatMix wheel
-  over HID (vendor-specific).
-
-To adapt to a different headset, see
-[Adapting to other hardware](#adapting-to-other-hardware) below.
+Mic path: raw mic feeds `sonar-mic-filterchain.service`, an isolated PipeWire subprocess running a filter-chain config generated from `mic-effects.json`. The chain is RNNoise > Calf Gate > Calf Equalizer8Band > Calf Compressor > Calf Limiter. Any subset of stages can be enabled.
 
 ## Dependencies
 
-All Arch packages (translate as needed for your distro):
+Arch packages (translate for your distro):
 
-- `pipewire`, `pipewire-pulse`, `wireplumber` — the audio stack
-- `python`, `python-gobject`, `gtk4`, `libadwaita` — the GUI
-- `calf` — the LV2 plugin bundle (gate, EQ, compressor, limiter)
-- `rnnoise-ladspa` or equivalent — [librnnoise_ladspa.so](https://github.com/werman/noise-suppression-for-voice)
-- `libpulse` — for `pactl` and `parec`
-- `python-hid` — **optional**, only for ChatMix wheel support
-- `waybar` — **optional**, for the status bar integration
+- `pipewire`, `pipewire-pulse`, `wireplumber`
+- `python`, `python-gobject`, `gtk4`, `libadwaita`
+- `calf` (gate, EQ, compressor, limiter)
+- `rnnoise-ladspa` ([librnnoise_ladspa.so](https://github.com/werman/noise-suppression-for-voice))
+- `libpulse` (for `pactl` and `parec`)
+- `python-hid` (optional, ChatMix wheel only)
+- `waybar` (optional, status bar integration)
 
 ## Install
 
@@ -113,48 +67,37 @@ cd linux-sonar
 ./install.sh
 ```
 
-The installer:
-
-1. Copies `bin/sonar-mixer` → `~/.local/bin/sonar-mixer`
-2. Copies PipeWire / WirePlumber configs to `~/.config/pipewire/pipewire.conf.d/`
-   and `~/.config/wireplumber/wireplumber.conf.d/`
-3. Copies systemd user units to `~/.config/systemd/user/`
-4. Copies waybar scripts (if `~/.config/waybar/` exists)
-5. Restarts `pipewire` + `wireplumber` so the new sinks appear
-6. Runs `sonar-mixer --write-mic-config` to generate the mic filter-chain config
-7. Enables and starts `sonar-daemon.service` and `sonar-mic-filterchain.service`
+The installer copies `bin/sonar-mixer` to `~/.local/bin/`, drops PipeWire and WirePlumber configs, installs systemd user units, copies waybar scripts if `~/.config/waybar/` exists, restarts pipewire, generates the mic filter-chain config, and enables the daemon + mic services.
 
 After install, run `sonar-mixer` to open the GUI.
 
-Make sure `~/.local/bin` is in your `PATH` (most shells already do this).
+Make sure `~/.local/bin` is in your `PATH`.
 
 ## Usage
 
-**GUI**: `sonar-mixer`. You'll see five channel strips (volume + mute),
-a ChatMix slider, a mic effects panel (collapsed by default — click the
-header to expand), and a live per-app routing panel at the bottom.
+**GUI**: `sonar-mixer`. Five channel strips with volume and mute, a ChatMix slider, a collapsible mic effects panel, and a live per-app routing panel at the bottom.
 
 **CLI**:
 
 | Flag                       | What it does |
 | -------------------------- | ------------ |
 | `sonar-mixer`              | Launch the GUI |
-| `sonar-mixer --daemon`     | Run the headless routing + ChatMix + live-auto-tune daemon (used by systemd) |
-| `sonar-mixer --write-mic-config` | Regenerate `~/.config/sonar-mixer/mic-filter-chain.conf` from `mic-effects.json` |
-| `sonar-mixer --set-mic-input <key>` | Switch which raw mic is fed into the filter chain |
+| `sonar-mixer --daemon`     | Headless routing + ChatMix + auto-tune daemon |
+| `sonar-mixer --write-mic-config` | Regenerate mic filter-chain config from mic-effects.json |
+| `sonar-mixer --set-mic-input <key>` | Switch raw mic input source |
 
-**Config files** (all under `~/.config/sonar-mixer/`):
+**Config files** (`~/.config/sonar-mixer/`):
 
 | File                     | Written by | Purpose |
 | ------------------------ | ---------- | ------- |
-| `routing.json`           | GUI        | Per-app preferred channel map |
+| `routing.json`           | GUI        | Per-app channel map |
 | `mic-effects.json`       | GUI        | Mic effect parameters + live-tune state |
 | `mic-filter-chain.conf`  | `--write-mic-config` | Generated PipeWire filter-chain config |
-| `chatmix-base.json`      | GUI        | Game/Chat volume snapshot used as the ChatMix baseline |
+| `chatmix-base.json`      | GUI        | Game/Chat volume snapshot for ChatMix baseline |
 
 See `examples/routing.example.json` for the routing format.
 
-**Waybar**: the recommended module, once scripts are installed:
+**Waybar**:
 
 ```jsonc
 "custom/sonar": {
@@ -165,82 +108,30 @@ See `examples/routing.example.json` for the routing format.
 }
 ```
 
-`waybar/sonar.py` shows all five channels at once.
-`waybar/sonar-channel.py <ChannelName>` shows a single channel — useful
-for putting Game+Chat on one side of your bar and Media+AUX on the other.
+`sonar.py` shows all five channels. `sonar-channel.py <ChannelName>` shows one. Useful for splitting Game+Chat and Media+AUX across your bar.
 
 ## Adapting to other hardware
 
-Three places hardcode the Arctis Nova 7. To point this at a different
-headset/DAC/speakers:
+Three places reference the Arctis Nova 7. To use a different headset or DAC:
 
-**1. The ALSA output node**. Find yours:
+**1. ALSA output node.** Find yours with `pactl list sinks short | grep alsa_output`. Open `~/.config/pipewire/pipewire.conf.d/10-sonar-sinks.conf` and replace all five occurrences of `alsa_output.usb-SteelSeries_Arctis_Nova_7-00.analog-stereo` with your node. Restart with `systemctl --user restart pipewire`.
 
-```sh
-pactl list sinks short | grep alsa_output
-# e.g.  alsa_output.pci-0000_00_1f.3.analog-stereo
-```
+**2. Suspend-timeout rule.** Open `~/.config/wireplumber/wireplumber.conf.d/50-sonar-routing.conf` and replace the `node.name` match. Delete the rule entirely if suspend-pops aren't a problem.
 
-Open `~/.config/pipewire/pipewire.conf.d/10-sonar-sinks.conf` and replace
-all five occurrences of
-`alsa_output.usb-SteelSeries_Arctis_Nova_7-00.analog-stereo` with your node
-name. Then:
+**3. ChatMix wheel.** If your headset has no ChatMix HID, the daemon logs an error and continues fine. Use the on-screen slider instead. To add support for a different HID protocol, patch `_chatmix_daemon_thread` in `bin/sonar-mixer`. Patches welcome.
 
-```sh
-systemctl --user restart pipewire
-```
-
-**2. The suspend-timeout rule**. Open
-`~/.config/wireplumber/wireplumber.conf.d/50-sonar-routing.conf` and
-replace the `node.name` match with your ALSA node. (Or delete the rule
-entirely if suspend-pops aren't a problem for your hardware.)
-
-**3. The ChatMix wheel** (optional). If your headset doesn't expose a
-ChatMix wheel over USB-HID, the daemon will log `ChatMix error: unable
-to open device, retrying…` and otherwise work fine — you can still use
-the on-screen ChatMix slider. If your headset has a *different* HID
-protocol you want to support, the code lives in
-`_chatmix_daemon_thread` in `bin/sonar-mixer`; patches welcome.
-
-**Mic input** is auto-discovered via `_MIC_INPUT_TARGETS` at the top of
-`bin/sonar-mixer` — add your device's ALSA source name to that dict.
+**Mic input** auto-discovers via `_MIC_INPUT_TARGETS` at the top of `bin/sonar-mixer`. Add your ALSA source name there.
 
 ## Troubleshooting
 
-**The Sonar sinks don't appear.** Check
-`systemctl --user status pipewire` and run
-`pactl list sinks short | grep Sonar`. If the 10-sonar-sinks.conf file
-is syntactically wrong, PipeWire logs the error — `journalctl --user
--u pipewire`. Any typo in `target.object` prevents the sink from
-materializing.
+**Sinks don't appear.** Check `systemctl --user status pipewire` and `pactl list sinks short | grep Sonar`. Syntax errors in the config kill the sink silently. Check `journalctl --user -u pipewire`. A typo in `target.object` prevents the sink from loading.
 
-**Per-app routing doesn't stick.** The daemon needs to be running:
-`systemctl --user status sonar-daemon`. WirePlumber also needs to be
-allowed to persist stream properties (its default) — check
-`~/.local/state/wireplumber/stream-properties` exists and is being
-updated.
+**Per-app routing doesn't stick.** Ensure `systemctl --user status sonar-daemon` is active. WirePlumber must be allowed to persist stream properties. Check that `~/.local/state/wireplumber/stream-properties` exists and updates on route changes.
 
-**Mic effects click on every parameter change.** The debounce window
-is 600 ms and the fade is ~60 ms out / 80 ms in — if you're hearing a
-click, the subprocess is crashing on restart. Check
-`journalctl --user -u sonar-mic-filterchain` for a SIGSEGV. This is
-usually a plugin compatibility issue (old Calf vs current PipeWire).
+**Mic effects click on parameter change.** The subprocess is crashing on restart. Check `journalctl --user -u sonar-mic-filterchain` for a SIGSEGV. Usually a Calf plugin compatibility issue with your PipeWire version.
 
-**`EasyEffects` breaks routing.** EasyEffects' output pipeline
-intercepts every stream globally and bypasses per-channel routing. If
-you use EasyEffects, disable its *output* pipeline (the input pipeline
-is fine, though redundant with the RNNoise in this project).
+**EasyEffects breaks routing.** Its output pipeline intercepts every stream globally and bypasses per-channel routing. Disable the EasyEffects output pipeline. Its input pipeline is fine, though redundant with the RNNoise chain here.
 
 ## License
 
-GPL-3.0. See [LICENSE](LICENSE).
-
-## Acknowledgements
-
-- SteelSeries Sonar for the UX inspiration.
-- The PipeWire and WirePlumber teams for making this kind of thing
-  possible without kernel modules.
-- [noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice)
-  for the RNNoise LADSPA plugin.
-- [Calf Studio Gear](https://calf-studio-gear.org/) for the Gate / EQ /
-  Compressor / Limiter LV2 plugins.
+GPL-3.0.
