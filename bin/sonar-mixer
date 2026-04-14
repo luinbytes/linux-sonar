@@ -1,0 +1,3458 @@
+#!/usr/bin/env python3
+"""
+Sonar Mixer — GTK4/libadwaita PipeWire volume mixer.
+Replicates SteelSeries Sonar: channel strips + live app routing panel + ChatMix.
+
+Dependencies (all on Arch):  python  python-gobject  gtk4  libadwaita
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk
+
+
+# ---------------------------------------------------------------------------
+# PipeWire / pactl helpers
+# ---------------------------------------------------------------------------
+
+def _run(cmd: list[str]) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+
+
+def _pw_dump() -> list[dict]:
+    try:
+        return json.loads(_run(["pw-dump"]))
+    except Exception:
+        return []
+
+
+def parse_ids(status: str) -> dict[str, int | None]:
+    """Map channel names → wpctl node IDs by parsing `wpctl status`."""
+    ids: dict[str, int | None] = {
+        "Game": None, "Chat": None, "Media": None,
+        "AUX": None, "VoiceChat": None, "Mic": None,
+    }
+    for m in re.finditer(
+        r"^\s.*?\*?\s+(\d+)\.\s+(Sonar_Game|Sonar_Chat|Sonar_Media|Sonar_AUX|Sonar_VoiceChat)\b",
+        status, re.MULTILINE,
+    ):
+        ids[m.group(2).replace("Sonar_", "")] = int(m.group(1))
+
+    # Mic: search only inside the Sources block
+    src_lines, in_audio, in_src = [], False, False
+    for line in status.splitlines():
+        s = line.strip()
+        if s == "Audio":       in_audio = True
+        elif s == "Video":     in_audio = False
+        if in_audio and "Sources:" in line:  in_src = True
+        elif in_src and "Filters:" in line:  break
+        if in_src: src_lines.append(line)
+    # Prefer our noise-cancelled virtual mic; fall back to physical QuadCast
+    m = re.search(r"^\s.*?\*?\s+(\d+)\.\s+Sonar_Mic\b",
+                  "\n".join(src_lines), re.MULTILINE)
+    if not m:
+        m = re.search(r"^\s.*?\*?\s+(\d+)\.\s+HyperX QuadCast",
+                      "\n".join(src_lines), re.MULTILINE)
+    if m:
+        ids["Mic"] = int(m.group(1))
+    return ids
+
+
+def get_volume(node_id: int) -> tuple[float, bool]:
+    out = _run(["wpctl", "get-volume", str(node_id)])
+    return (
+        float(m.group(1)) if (m := re.search(r"Volume:\s+([\d.]+)", out)) else 1.0,
+        "[MUTED]" in out,
+    )
+
+
+def set_volume(node_id: int, value: float) -> None:
+    _run(["wpctl", "set-volume", str(node_id), f"{max(0.0, min(1.5, value)):.4f}"])
+
+
+def set_mute(node_id: int, muted: bool) -> None:
+    _run(["wpctl", "set-mute", str(node_id), "1" if muted else "0"])
+
+
+def _get_pactl_input_map() -> dict[int, int]:
+    """Returns {pipewire_node_id: pactl_sink_input_index}"""
+    out = _run(["pactl", "list", "sink-inputs"])
+    result: dict[int, int] = {}
+    current_idx: int | None = None
+    for line in out.splitlines():
+        m = re.match(r'^Sink Input #(\d+)', line.strip())
+        if m:
+            current_idx = int(m.group(1))
+        elif current_idx is not None:
+            m2 = re.search(r'object\.id\s*=\s*"(\d+)"', line)
+            if m2:
+                result[int(m2.group(1))] = current_idx
+    return result
+
+
+def move_stream(node_id: int, channel: str) -> bool:
+    """Move a PipeWire output stream to a Sonar channel using pactl."""
+    sink_name = f"Sonar_{channel}"
+    input_map = _get_pactl_input_map()
+    pactl_idx = input_map.get(node_id)
+    if pactl_idx is None:
+        print(f"[sonar-mixer] node {node_id} not in pactl sink-inputs", file=sys.stderr)
+        return False
+    r = subprocess.run(["pactl", "move-sink-input", str(pactl_idx), sink_name],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[sonar-mixer] move {node_id}→{sink_name} failed: {r.stderr.strip()}",
+              file=sys.stderr)
+    return r.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Routing preferences — persists user's app→channel choices
+# ---------------------------------------------------------------------------
+
+_PREFS_FILE = Path.home() / ".config" / "sonar-mixer" / "routing.json"
+
+
+def load_routing_prefs() -> dict[str, str]:
+    try:
+        return json.loads(_PREFS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_routing_pref(app_name: str, channel: str) -> None:
+    """
+    Persist app→channel preference.
+    Routing is enforced via pactl move-sink-input; WirePlumber's state
+    restoration then remembers the target for subsequent connections.
+    Note: stream.rules update-props with target.object is NOT used because
+    it blocks WirePlumber's state restoration without providing routing.
+    """
+    prefs = load_routing_prefs()
+    prefs[app_name] = channel
+    _PREFS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PREFS_FILE.write_text(json.dumps(prefs, indent=2))
+
+
+def _resolve_app_name(props: dict) -> str:
+    """Get a human-readable app name, unwrapping Electron subprocess names."""
+    name = props.get("application.name", "")
+    binary = props.get("application.process.binary", "")
+    pid = props.get("application.process.id")
+
+    if binary in ("electron", "electron40") and pid:
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                        break
+            with open(f"/proc/{ppid}/cmdline", "rb") as f:
+                cmd = f.read().decode("utf-8", errors="replace").replace("\x00", " ")
+            for m in re.finditer(r"/usr/(?:lib|share)/([^/\s]+)", cmd):
+                seg = m.group(1)
+                if "electron" not in seg.lower():
+                    return seg.replace("-", " ").title()
+        except Exception:
+            pass
+
+    return (name
+            or props.get("node.description", "")
+            or props.get("media.name", "")
+            or props.get("node.name", "")
+            or "Unknown")
+
+
+# ---------------------------------------------------------------------------
+# Role-based default channel assignment
+# ---------------------------------------------------------------------------
+
+ROLE_DEFAULTS: dict[str, str] = {
+    "Music":        "AUX",
+    "music":        "AUX",
+    "Communication": "Chat",
+    "communication": "Chat",
+    "Game":         "Game",
+    "game":         "Game",
+    "Movie":        "Media",
+    "Video":        "Media",
+    "Notification": "Game",
+}
+
+
+def default_channel(media_role: str | None) -> str:
+    return ROLE_DEFAULTS.get(media_role or "", "Game")
+
+
+def get_active_streams(
+        sonar_ids: dict[str, int | None]
+) -> list[tuple[int, str, str | None, str | None]]:
+    """
+    Returns (node_id, app_name, current_channel_or_None, media_role_or_None)
+    for every live output stream not owned by EasyEffects or Sonar internals.
+    """
+    data = _pw_dump()
+    if not data:
+        return []
+
+    id_to_channel = {v: k for k, v in sonar_ids.items() if v and k != "Mic"}
+
+    # Build client_id → props for native PipeWire apps (Spotify etc.)
+    client_props: dict[int, dict] = {
+        obj["id"]: obj.get("info", {}).get("props", {})
+        for obj in data
+        if obj.get("type") == "PipeWire:Interface:Client"
+    }
+
+    # Collect all interesting node IDs (EasyEffects nodes we want to skip)
+    ee_node_ids: set[int] = {
+        obj["id"] for obj in data
+        if obj.get("type") == "PipeWire:Interface:Node"
+        and "easyeffects" in obj.get("info", {}).get("props", {}).get("node.name", "")
+    }
+
+    streams: dict[int, tuple[str, str | None]] = {}
+    for obj in data:
+        if obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        if obj["id"] in ee_node_ids:
+            continue
+        props = obj.get("info", {}).get("props", {})
+        if props.get("media.class") != "Stream/Output/Audio":
+            continue
+        nname = props.get("node.name", "")
+        if nname.startswith("Sonar_") or "loopback" in nname.lower():
+            continue
+
+        # Merge with Client props if node is missing app-identifying info
+        # (native PipeWire apps like Spotify have it only on the Client object)
+        merged = dict(props)
+        if not props.get("application.name") and not props.get("application.process.binary"):
+            cid = props.get("client.id")
+            if cid is not None:
+                for k, v in client_props.get(cid, {}).items():
+                    if not merged.get(k):   # don't overwrite non-empty node values
+                        merged[k] = v
+
+        media_role: str | None = merged.get("media.role") or None
+        streams[obj["id"]] = (_resolve_app_name(merged), media_role)
+
+    # Determine which Sonar channel each stream is currently linked to
+    stream_channel: dict[int, str] = {}
+    for obj in data:
+        if obj.get("type") != "PipeWire:Interface:Link":
+            continue
+        info = obj.get("info", {})
+        out_id = info.get("output-node-id")
+        in_id  = info.get("input-node-id")
+        if out_id in streams and in_id in id_to_channel:
+            stream_channel[out_id] = id_to_channel[in_id]
+
+    return [
+        (sid, name, stream_channel.get(sid), role)
+        for sid, (name, role) in sorted(streams.items())
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Daemon mode — routing enforcer with no UI
+# ---------------------------------------------------------------------------
+
+_CHATMIX_BASE_FILE = Path.home() / ".config" / "sonar-mixer" / "chatmix-base.json"
+
+
+def _load_chatmix_base() -> tuple[float, float]:
+    try:
+        data = json.loads(_CHATMIX_BASE_FILE.read_text())
+        return float(data.get("game", 1.0)), float(data.get("chat", 1.0))
+    except Exception:
+        return 1.0, 1.0
+
+
+def _save_chatmix_base(game: float, chat: float) -> None:
+    try:
+        _CHATMIX_BASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _CHATMIX_BASE_FILE.write_text(json.dumps({"game": game, "chat": chat}))
+    except Exception:
+        pass
+
+
+def _update_chatmix_base(channel: str, value: float) -> None:
+    """Update one channel's base volume. Called when the user moves a strip slider."""
+    try:
+        data = json.loads(_CHATMIX_BASE_FILE.read_text()) if _CHATMIX_BASE_FILE.exists() else {}
+    except Exception:
+        data = {}
+    data[channel] = value
+    _save_chatmix_base(data.get("game", 1.0), data.get("chat", 1.0))
+
+
+# ---------------------------------------------------------------------------
+# Mic effects — SteelSeries Sonar-style processing via dedicated filter-chain
+# ---------------------------------------------------------------------------
+
+_MIC_EFFECTS_FILE = Path.home() / ".config" / "sonar-mixer" / "mic-effects.json"
+_MIC_CHAIN_CONF   = Path.home() / ".config" / "sonar-mixer" / "mic-filter-chain.conf"
+
+# Available raw mic inputs the filter-chain can pull from. The waybar
+# discord-mic swapper toggles between these by calling
+#     sonar-mixer --set-mic-input <key>
+# which updates _state.mic_input and restarts the subprocess.
+_MIC_INPUT_TARGETS: dict[str, str] = {
+    "hyperx": "alsa_input.usb-Kingston_HyperX_Quadcast_4110-00.analog-stereo",
+    "arctis": "alsa_input.usb-SteelSeries_Arctis_Nova_7-00.mono-fallback",
+}
+_MIC_INPUT_DEFAULT = "hyperx"
+
+
+def _get_active_mic_input_key() -> str:
+    key = _get_mic_state_key("mic_input", _MIC_INPUT_DEFAULT) or _MIC_INPUT_DEFAULT
+    return key if key in _MIC_INPUT_TARGETS else _MIC_INPUT_DEFAULT
+
+
+def _get_active_mic_input_target() -> str:
+    return _MIC_INPUT_TARGETS[_get_active_mic_input_key()]
+
+
+# Back-compat alias used by the VAD and auto-tune workers (they sample from
+# whatever raw mic is currently selected).
+_MIC_INPUT_TARGET = _MIC_INPUT_TARGETS[_MIC_INPUT_DEFAULT]
+
+# All mic-related JSON state lives in ONE file: mic-effects.json.
+# Effect values live at the top level (rnnoise, gate, eq, etc.).
+# Meta-state lives under keys prefixed with "_" (ignored by effect merge):
+#   "_state"           — UI state like the active preset name
+#   "_custom_presets"  — user-saved named presets
+
+
+def _read_mic_json() -> dict:
+    """Raw read of the unified mic JSON file."""
+    try:
+        d = json.loads(_MIC_EFFECTS_FILE.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_mic_json(data: dict) -> None:
+    try:
+        _MIC_EFFECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _MIC_EFFECTS_FILE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def _set_mic_state_key(key: str, value) -> None:
+    """Update a single meta-state key in mic-effects.json under _state."""
+    full = _read_mic_json()
+    state = full.get("_state") if isinstance(full.get("_state"), dict) else {}
+    state[key] = value
+    full["_state"] = state
+    _write_mic_json(full)
+
+
+def _get_mic_state_key(key: str, default=None):
+    state = _read_mic_json().get("_state")
+    if isinstance(state, dict):
+        return state.get(key, default)
+    return default
+
+
+def _set_active_preset(name: str) -> None:
+    _set_mic_state_key("active_preset", name)
+
+
+def _get_active_preset() -> str:
+    return _get_mic_state_key("active_preset", "Default") or "Default"
+
+_MIC_EFFECTS_DEFAULT = {
+    "rnnoise":    {"enabled": True,  "threshold": 50.0},
+    "gate":       {"enabled": False, "threshold_db": -40.0, "attack": 20.0, "release": 250.0, "ratio": 2.0},
+    "eq": {
+        "enabled": False,
+        "bands": [
+            # Low shelf + 4 peaking bands + high shelf — standard voice EQ layout
+            {"type": "ls", "freq":    100.0, "gain_db": 0.0},
+            {"type": "p1", "freq":    250.0, "gain_db": 0.0},
+            {"type": "p2", "freq":   1000.0, "gain_db": 0.0},
+            {"type": "p3", "freq":   3000.0, "gain_db": 0.0},
+            {"type": "p4", "freq":   8000.0, "gain_db": 0.0},
+            {"type": "hs", "freq":  12000.0, "gain_db": 0.0},
+        ],
+    },
+    "compressor": {"enabled": False, "threshold_db": -18.0, "ratio": 3.0, "attack": 20.0, "release": 250.0, "makeup_db": 9.0},
+    "limiter":    {"enabled": True,  "ceiling_db": -1.0},
+}
+
+
+# Ready-made presets inspired by SteelSeries Sonar's voice presets.
+# Each preset is a full settings dict that replaces the live state.
+_MIC_PRESETS: dict[str, dict] = {
+    "Default": _MIC_EFFECTS_DEFAULT,
+
+    "Clarity": {
+        # Cuts muddiness and boosts intelligibility — good for general voice chat
+        "rnnoise":    {"enabled": True,  "threshold": 50.0},
+        "gate":       {"enabled": True,  "threshold_db": -50.0, "attack": 5.0,  "release": 150.0, "ratio": 4.0},
+        "eq": {
+            "enabled": True,
+            "bands": [
+                {"type": "ls", "freq":   100.0, "gain_db": -4.0},   # cut rumble
+                {"type": "p1", "freq":   250.0, "gain_db": -3.0},   # cut mud
+                {"type": "p2", "freq":  1000.0, "gain_db": +1.0},
+                {"type": "p3", "freq":  3000.0, "gain_db": +3.0},   # presence
+                {"type": "p4", "freq":  8000.0, "gain_db": +2.0},   # clarity
+                {"type": "hs", "freq": 12000.0, "gain_db": +1.0},   # air
+            ],
+        },
+        "compressor": {"enabled": True,  "threshold_db": -20.0, "ratio": 3.0, "attack": 15.0, "release": 200.0, "makeup_db": 9.0},
+        "limiter":    {"enabled": True,  "ceiling_db": -1.0},
+    },
+
+    "Warmth": {
+        # More body and low-mids — good for thin or nasal voices
+        "rnnoise":    {"enabled": True,  "threshold": 50.0},
+        "gate":       {"enabled": True,  "threshold_db": -55.0, "attack": 5.0, "release": 200.0, "ratio": 3.0},
+        "eq": {
+            "enabled": True,
+            "bands": [
+                {"type": "ls", "freq":   120.0, "gain_db": +3.0},   # body
+                {"type": "p1", "freq":   250.0, "gain_db": +2.0},
+                {"type": "p2", "freq":   800.0, "gain_db": +1.0},
+                {"type": "p3", "freq":  3000.0, "gain_db": -1.0},   # tame sibilance
+                {"type": "p4", "freq":  6000.0, "gain_db":  0.0},
+                {"type": "hs", "freq": 12000.0, "gain_db": -1.0},
+            ],
+        },
+        "compressor": {"enabled": True,  "threshold_db": -18.0, "ratio": 2.5, "attack": 20.0, "release": 250.0, "makeup_db": 9.0},
+        "limiter":    {"enabled": True,  "ceiling_db": -1.0},
+    },
+
+    "Broadcast": {
+        # Heavy processing for that radio/podcast sound
+        "rnnoise":    {"enabled": True,  "threshold": 65.0},
+        "gate":       {"enabled": True,  "threshold_db": -45.0, "attack": 2.0, "release": 120.0, "ratio": 6.0},
+        "eq": {
+            "enabled": True,
+            "bands": [
+                {"type": "ls", "freq":    90.0, "gain_db": -6.0},
+                {"type": "p1", "freq":   250.0, "gain_db": -2.0},
+                {"type": "p2", "freq":  1000.0, "gain_db": +2.0},
+                {"type": "p3", "freq":  3500.0, "gain_db": +4.0},
+                {"type": "p4", "freq":  8000.0, "gain_db": +3.0},
+                {"type": "hs", "freq": 12000.0, "gain_db": +2.0},
+            ],
+        },
+        "compressor": {"enabled": True,  "threshold_db": -24.0, "ratio": 5.0, "attack": 10.0, "release": 150.0, "makeup_db": 10.0},
+        "limiter":    {"enabled": True,  "ceiling_db": -1.0},
+    },
+
+    "Off (bypass all)": {
+        "rnnoise":    {"enabled": False, "threshold": 50.0},
+        "gate":       {"enabled": False, "threshold_db": -40.0, "attack": 20.0, "release": 250.0, "ratio": 2.0},
+        "eq":         {"enabled": False, "bands": [
+            {"type": "ls", "freq":   100.0, "gain_db": 0.0},
+            {"type": "p1", "freq":   250.0, "gain_db": 0.0},
+            {"type": "p2", "freq":  1000.0, "gain_db": 0.0},
+            {"type": "p3", "freq":  3000.0, "gain_db": 0.0},
+            {"type": "p4", "freq":  8000.0, "gain_db": 0.0},
+            {"type": "hs", "freq": 12000.0, "gain_db": 0.0},
+        ]},
+        "compressor": {"enabled": False, "threshold_db": -18.0, "ratio": 3.0, "attack": 20.0, "release": 250.0, "makeup_db": 9.0},
+        "limiter":    {"enabled": False, "ceiling_db": -1.0},
+    },
+}
+
+
+# Per-control tooltips — shown on hover. Keep plain-English, beginner-friendly.
+_MIC_TOOLTIPS = {
+    "rnnoise.enabled":      "AI-powered background noise removal (keyboard, fans, hum).",
+    "rnnoise.threshold":    "How aggressive the noise removal is. Higher = more noise killed, but may cut quiet speech.",
+
+    "gate.enabled":         "Cuts the signal completely below a volume threshold — silences background between words.",
+    "gate.threshold_db":    "The quietest volume that opens the gate. Below this, the mic is silenced.",
+    "gate.attack":          "How fast the gate opens when you start speaking. Lower = snappier.",
+    "gate.release":         "How long the gate stays open after you stop speaking.",
+    "gate.ratio":            "How aggressively the gate closes. Higher = harder cut.",
+
+    "eq.enabled":           "Boost or cut specific frequency bands to shape your voice tone.",
+    "eq.band":              "Drag up to boost this frequency, down to cut it.",
+
+    "compressor.enabled":   "Evens out your volume — loud parts get quieter, quiet parts stay audible.",
+    "compressor.threshold_db": "Volume above which compression kicks in.",
+    "compressor.ratio":     "How much to squash loud sounds. 3:1 = every 3 dB over gets reduced to 1 dB over.",
+    "compressor.attack":    "How fast compression reacts to loud sounds.",
+    "compressor.release":   "How fast the compressor lets go after loud sounds end.",
+    "compressor.makeup_db": "Volume boost after compression, to bring the overall level back up.",
+
+    "limiter.enabled":      "Safety catch — hard ceiling to prevent clipping/distortion.",
+    "limiter.ceiling_db":   "The absolute maximum volume the mic can reach.",
+}
+
+
+def _reset_mic_effects_to_defaults() -> None:
+    import copy
+    _save_mic_effects(copy.deepcopy(_MIC_EFFECTS_DEFAULT))
+
+
+# ── Custom user presets (stored under _custom_presets in mic-effects.json) ──
+
+def _load_custom_presets() -> dict[str, dict]:
+    custom = _read_mic_json().get("_custom_presets")
+    return custom if isinstance(custom, dict) else {}
+
+
+def _save_custom_presets(data: dict[str, dict]) -> None:
+    full = _read_mic_json()
+    full["_custom_presets"] = data
+    _write_mic_json(full)
+
+
+def _save_custom_preset(name: str) -> bool:
+    """Snapshot the current mic-effects.json as a named custom preset."""
+    import copy
+    name = (name or "").strip()
+    if not name or name in _MIC_PRESETS:
+        return False   # reject empty or built-in name clashes
+    data = _load_custom_presets()
+    data[name] = copy.deepcopy(_load_mic_effects())
+    _save_custom_presets(data)
+    return True
+
+
+def _delete_custom_preset(name: str) -> None:
+    data = _load_custom_presets()
+    if name in data:
+        del data[name]
+        _save_custom_presets(data)
+
+
+def _all_preset_names() -> list[str]:
+    """Return built-in presets followed by custom presets (with ✦ prefix)."""
+    custom = list(_load_custom_presets().keys())
+    return list(_MIC_PRESETS.keys()) + [f"✦ {n}" for n in custom]
+
+
+def _apply_preset_by_display_name(display_name: str) -> bool:
+    """Apply a preset by its display name (may have ✦ prefix for custom)."""
+    import copy
+    if display_name in _MIC_PRESETS:
+        _save_mic_effects(copy.deepcopy(_MIC_PRESETS[display_name]))
+        return True
+    if display_name.startswith("✦ "):
+        raw_name = display_name[2:]
+        custom = _load_custom_presets()
+        if raw_name in custom:
+            _save_mic_effects(copy.deepcopy(custom[raw_name]))
+            return True
+    return False
+
+
+def _apply_mic_preset(name: str) -> bool:
+    """Legacy name — apply any preset (built-in or custom) by exact dict key."""
+    import copy
+    if name in _MIC_PRESETS:
+        _save_mic_effects(copy.deepcopy(_MIC_PRESETS[name]))
+        return True
+    custom = _load_custom_presets()
+    if name in custom:
+        _save_mic_effects(copy.deepcopy(custom[name]))
+        return True
+    return False
+
+
+def _get_default_source_name() -> str:
+    """Return the node.name of the current system default audio source."""
+    try:
+        r = subprocess.run(
+            ["pactl", "get-default-source"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _set_default_source(node_name: str) -> bool:
+    """Set the given node.name as the default audio source."""
+    try:
+        r = subprocess.run(
+            ["pactl", "set-default-source", node_name],
+            capture_output=True, text=True, timeout=2,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _db_to_linear(db: float) -> float:
+    return 10.0 ** (db / 20.0)
+
+
+def _load_mic_effects() -> dict:
+    """Load mic effect settings, merging with defaults so new/missing keys never crash.
+    Meta keys (prefixed with `_`) are skipped — use _read_mic_json for raw access."""
+    import copy
+    data = copy.deepcopy(_MIC_EFFECTS_DEFAULT)
+    saved = _read_mic_json()
+    if not saved:
+        return data
+    for key, default in data.items():
+        if key not in saved or not isinstance(saved[key], dict):
+            continue
+        if key == "eq":
+            saved_eq = saved[key]
+            default["enabled"] = bool(saved_eq.get("enabled", default["enabled"]))
+            saved_bands = saved_eq.get("bands")
+            if isinstance(saved_bands, list) and len(saved_bands) == len(default["bands"]):
+                for i, band in enumerate(saved_bands):
+                    if not isinstance(band, dict):
+                        continue
+                    if "gain_db" in band:
+                        try:
+                            default["bands"][i]["gain_db"] = float(band["gain_db"])
+                        except (TypeError, ValueError):
+                            pass
+        else:
+            for k, v in saved[key].items():
+                if k in default:
+                    default[k] = v
+    return data
+
+
+def _save_mic_effects(data: dict) -> None:
+    """Write effect values while preserving meta keys (_state, _custom_presets)."""
+    full = _read_mic_json()
+    # Overwrite only the effect keys; meta keys are left alone
+    for key in _MIC_EFFECTS_DEFAULT.keys():
+        if key in data:
+            full[key] = data[key]
+    _write_mic_json(full)
+
+
+def _update_mic_effect(effect: str, key: str, value) -> None:
+    """Update one field of one effect. Called from the UI on slider/toggle changes."""
+    data = _load_mic_effects()
+    if effect not in data:
+        return
+    if key == "band":
+        # value is (band_index, gain_db)
+        idx, gain_db = value
+        data["eq"]["bands"][idx]["gain_db"] = float(gain_db)
+    else:
+        data[effect][key] = value
+    _save_mic_effects(data)
+
+
+# Stereo port names per plugin — (left_in, right_in, left_out, right_out).
+# Used to build explicit links between nodes in the filter graph.
+_MIC_PLUGIN_PORTS = {
+    "rnnoise": ("Input (L)",  "Input (R)",  "Output (L)", "Output (R)"),
+    "gate":    ("in_l", "in_r", "out_l", "out_r"),
+    "eq":      ("in_l", "in_r", "out_l", "out_r"),
+    "comp":    ("in_l", "in_r", "out_l", "out_r"),
+    "limit":   ("in_l", "in_r", "out_l", "out_r"),
+}
+
+
+def _build_mic_filter_chain_conf(effects: dict | None = None) -> str:
+    """Return the pipewire -c config text for the mic filter-chain subprocess."""
+    if effects is None:
+        effects = _load_mic_effects()
+
+    # ── 1. Build the list of nodes in order ───────────────────────────────
+    node_lines: list[str] = []
+    chain: list[str] = []   # ordered list of node name keys for linking
+
+    if effects["rnnoise"]["enabled"]:
+        t = max(0.0, min(100.0, float(effects["rnnoise"]["threshold"])))
+        node_lines.append(
+            f'        {{ type=ladspa name=rnnoise plugin="librnnoise_ladspa" '
+            f'label=noise_suppressor_stereo control = {{ "VAD Threshold (%)" = {t} }} }}'
+        )
+        chain.append("rnnoise")
+
+    if effects["gate"]["enabled"]:
+        g = effects["gate"]
+        thr = max(0.000977, min(1.0, _db_to_linear(float(g["threshold_db"]))))
+        ratio   = max(1.0,  min(20.0,   float(g["ratio"])))
+        attack  = max(0.01, min(2000.0, float(g["attack"])))
+        release = max(0.01, min(2000.0, float(g["release"])))
+        node_lines.append(
+            '        { type=lv2 name=gate plugin="http://calf.sourceforge.net/plugins/Gate" '
+            f'control = {{ threshold={thr} ratio={ratio} attack={attack} release={release} }} }}'
+        )
+        chain.append("gate")
+
+    if effects["eq"]["enabled"]:
+        ctrl_parts: list[str] = []
+        for band in effects["eq"]["bands"]:
+            btype = band["type"]
+            freq  = max(10.0, min(20000.0, float(band["freq"])))
+            level = max(0.015625, min(64.0, _db_to_linear(float(band["gain_db"]))))
+            ctrl_parts.append(f"{btype}_active=1 {btype}_freq={freq} {btype}_level={level}")
+        node_lines.append(
+            '        { type=lv2 name=eq plugin="http://calf.sourceforge.net/plugins/Equalizer8Band" '
+            f'control = {{ {" ".join(ctrl_parts)} }} }}'
+        )
+        chain.append("eq")
+
+    if effects["compressor"]["enabled"]:
+        c = effects["compressor"]
+        thr = max(0.000977, min(1.0, _db_to_linear(float(c["threshold_db"]))))
+        ratio   = max(1.0,  min(20.0,   float(c["ratio"])))
+        attack  = max(0.01, min(2000.0, float(c["attack"])))
+        release = max(0.01, min(2000.0, float(c["release"])))
+        makeup  = max(1.0,  min(64.0,   _db_to_linear(float(c["makeup_db"]))))
+        node_lines.append(
+            '        { type=lv2 name=comp plugin="http://calf.sourceforge.net/plugins/Compressor" '
+            f'control = {{ threshold={thr} ratio={ratio} attack={attack} release={release} makeup={makeup} }} }}'
+        )
+        chain.append("comp")
+
+    if effects["limiter"]["enabled"]:
+        ceiling = max(0.0625, min(1.0, _db_to_linear(float(effects["limiter"]["ceiling_db"]))))
+        node_lines.append(
+            '        { type=lv2 name=limit plugin="http://calf.sourceforge.net/plugins/Limiter" '
+            f'control = {{ limit={ceiling} attack=1.0 release=50.0 '
+            f'auto_level=0 asc=0 oversampling=1 }} }}'
+        )
+        chain.append("limit")
+
+    # ── 2. Fallback: no effects → single stereo passthrough via builtin copy ─
+    if not chain:
+        # Use two copy nodes (one per channel) for identity stereo
+        node_lines = [
+            '        { type=builtin name=pass_l label=copy }',
+            '        { type=builtin name=pass_r label=copy }',
+        ]
+        graph_body = (
+            '        nodes = [\n'
+            + "\n".join(node_lines)
+            + '\n        ]\n'
+            '        inputs  = [ "pass_l:In" "pass_r:In" ]\n'
+            '        outputs = [ "pass_l:Out" "pass_r:Out" ]\n'
+        )
+    else:
+        # ── 3. Build inputs/outputs/links for the stereo chain ────────────
+        def ports(n: str) -> tuple[str, str, str, str]:
+            return _MIC_PLUGIN_PORTS[n]
+
+        first = chain[0]
+        last  = chain[-1]
+        fL, fR, _, _ = ports(first)
+        _, _, lL, lR = ports(last)
+        inputs  = f'        inputs  = [ "{first}:{fL}" "{first}:{fR}" ]\n'
+        outputs = f'        outputs = [ "{last}:{lL}" "{last}:{lR}" ]\n'
+
+        link_lines: list[str] = []
+        for a, b in zip(chain, chain[1:]):
+            _, _, aL, aR = ports(a)
+            bL, bR, _, _ = ports(b)
+            link_lines.append(f'          {{ output = "{a}:{aL}" input = "{b}:{bL}" }}')
+            link_lines.append(f'          {{ output = "{a}:{aR}" input = "{b}:{bR}" }}')
+
+        if link_lines:
+            links = '        links = [\n' + "\n".join(link_lines) + "\n        ]\n"
+        else:
+            links = ""
+
+        graph_body = (
+            '        nodes = [\n'
+            + "\n".join(node_lines)
+            + '\n        ]\n'
+            + links
+            + inputs
+            + outputs
+        )
+
+    mic_target = _get_active_mic_input_target()
+    mic_key    = _get_active_mic_input_key()
+
+    return f"""# Generated by sonar-mixer — do not edit by hand.
+# Source of truth: ~/.config/sonar-mixer/mic-effects.json
+# Active input: {mic_key} ({mic_target})
+context.properties = {{
+  core.daemon = false
+  core.name   = pipewire-sonar-mic
+}}
+context.spa-libs = {{
+  audio.convert.* = audioconvert/libspa-audioconvert
+  support.*       = support/libspa-support
+}}
+context.modules = [
+  {{ name = libpipewire-module-protocol-native }}
+  {{ name = libpipewire-module-client-node }}
+  {{ name = libpipewire-module-adapter }}
+  {{ name = libpipewire-module-metadata }}
+  {{ name = libpipewire-module-filter-chain
+    flags = [ nofail ]
+    args = {{
+      node.description = "Sonar Mic (Processed)"
+      media.name       = "Sonar Mic"
+      filter.graph = {{
+{graph_body}      }}
+      audio.channels = 2
+      audio.position = [ FL FR ]
+      capture.props = {{
+        node.name     = "Sonar_Mic_in"
+        node.passive  = true
+        target.object = "{mic_target}"
+      }}
+      playback.props = {{
+        node.name     = "Sonar_Mic"
+        node.description = "Sonar Mic (Processed)"
+        media.class   = Audio/Source
+        audio.channels = 2
+        audio.position = [ FL FR ]
+        object.linger = true
+      }}
+    }}
+  }}
+]
+"""
+
+
+def _write_mic_filter_chain() -> None:
+    """Regenerate the mic filter-chain config from the JSON settings."""
+    try:
+        _MIC_CHAIN_CONF.parent.mkdir(parents=True, exist_ok=True)
+        _MIC_CHAIN_CONF.write_text(_build_mic_filter_chain_conf())
+    except Exception as e:
+        print(f"[sonar-mixer] failed to write mic filter-chain conf: {e}", flush=True)
+
+
+def _chatmix_daemon_thread(sonar_ids_ref: list) -> None:
+    """Read Arctis Nova 7 ChatMix HID and apply to Sonar_Game / Sonar_Chat."""
+    import time
+    try:
+        import hid
+    except ImportError:
+        print("[sonar-daemon] python-hid not available, ChatMix disabled", flush=True)
+        return
+
+    VENDOR_ID        = 0x1038
+    PRODUCT_ID       = 0x22a1
+    TARGET_INTERFACE = 5
+
+    last = None
+
+    while True:
+        try:
+            devs = hid.enumerate(VENDOR_ID, PRODUCT_ID)
+            target = next((d for d in devs if d['interface_number'] == TARGET_INTERFACE), None)
+            if target is None:
+                time.sleep(5)
+                continue
+
+            with hid.Device(path=target['path']) as dev:
+                # Read initial position via feature report
+                try:
+                    init = dev.get_feature_report(0x45, 64)
+                    if init and len(init) >= 3 and init[0] == 0x45:
+                        last = (init[1], init[2])
+                except Exception:
+                    pass
+
+                dev.nonblocking = True
+                print("[sonar-daemon] ChatMix HID connected", flush=True)
+
+                while True:
+                    data = dev.read(64)
+                    if data and len(data) >= 3 and data[0] == 0x45:
+                        game_val, chat_val = data[1], data[2]
+                        if (game_val, chat_val) != last:
+                            last = (game_val, chat_val)
+                            ids = sonar_ids_ref[0]
+                            game_id = ids.get("Game")
+                            chat_id = ids.get("Chat")
+
+                            # Re-read base file on every event so live strip
+                            # slider changes are picked up without restarting.
+                            base_game, base_chat = _load_chatmix_base()
+
+                            if game_val == 100 and chat_val == 100:
+                                # Center — restore exact base (never re-read pactl)
+                                if game_id:
+                                    set_volume(game_id, base_game)
+                                if chat_id:
+                                    set_volume(chat_id, base_chat)
+                            else:
+                                if game_id:
+                                    set_volume(game_id, base_game * game_val / 100)
+                                if chat_id:
+                                    set_volume(chat_id, base_chat * chat_val / 100)
+                    time.sleep(0.01)
+        except Exception as e:
+            print(f"[sonar-daemon] ChatMix error: {e}, retrying…", flush=True)
+            time.sleep(3)
+
+
+# ─── Live auto-tune — module-level (shared by GUI + daemon) ────────────────
+
+_AUTO_LIVE_STATUS_FILE = Path.home() / ".cache" / "sonar-mixer" / "live-status.json"
+
+_AUTO_TARGET_NOISE_DB  = -55.0
+_AUTO_TARGET_VOICE_DB  = -16.0
+_AUTO_TARGET_PEAK_DB   = -6.0
+_AUTO_GATE_HEADROOM_DB =  6.0
+_AUTO_SAMPLE_SEC       =  2.0
+_AUTO_INTERVAL_SEC     =  4.0
+_AUTO_HISTORY_LEN      =  5
+_AUTO_WARMUP_SAMPLES   =  3
+_AUTO_COOLDOWN_SEC     = 60.0
+_AUTO_ACTION_TOAST_SEC =  4.0
+
+# Per-iteration step size caps — auto can nudge each value by at most this much
+# per adjustment. Together with the 60s cooldown this gives a very gentle,
+# predictable drift toward the target. User slider moves aren't clamped at all.
+_AUTO_STEP_CAPS = {
+    "gate.threshold_db":        2.0,   # ±2 dB per step
+    "rnnoise.threshold":        3.0,   # ±3% per step
+    "compressor.threshold_db":  2.0,
+    "compressor.makeup_db":     1.5,
+}
+
+
+def _auto_sample_mic(duration_sec: float = _AUTO_SAMPLE_SEC) -> dict | None:
+    """Capture audio from the currently-active raw mic, compute noise/voice/peak."""
+    import struct, math, time as _time
+    try:
+        proc = subprocess.Popen(
+            ["parec", "--device", _get_active_mic_input_target(),
+             "--format=s16le", "--rate=48000", "--channels=1", "--raw"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+
+    target_bytes = int(48000 * 2 * duration_sec)
+    data = bytearray()
+    deadline = _time.monotonic() + duration_sec + 1.0
+    try:
+        while len(data) < target_bytes and _time.monotonic() < deadline:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                break
+            data.extend(chunk)
+    except Exception:
+        pass
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=0.5)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+
+    if len(data) < 24000:        # less than ~0.25 s captured
+        return None
+
+    n = len(data) // 2
+    samples = struct.unpack(f"<{n}h", bytes(data[: n * 2]))
+    win = 4800                   # 100 ms windows @ 48 kHz
+    rms_list: list[float] = []
+    for i in range(0, len(samples) - win, win):
+        s2 = 0
+        for v in samples[i : i + win]:
+            s2 += v * v
+        rms_list.append(math.sqrt(s2 / win))
+    if not rms_list:
+        return None
+
+    rms_sorted = sorted(rms_list)
+
+    def _rms_db(r: float) -> float:
+        return -100.0 if r < 1.0 else 20.0 * math.log10(r / 32768.0)
+
+    q = max(1, len(rms_sorted) // 4)
+    noise_rms = sum(rms_sorted[:q]) / q
+    t = max(1, len(rms_sorted) // 3)
+    voice_rms = sum(rms_sorted[-t:]) / t
+    peak_rms  = rms_sorted[-1]
+    noise_db  = _rms_db(noise_rms)
+    voice_db  = _rms_db(voice_rms)
+    peak_db   = _rms_db(peak_rms)
+    has_voice = (voice_db - noise_db) > 10.0
+    return {"noise_db": noise_db, "voice_db": voice_db, "peak_db": peak_db,
+            "has_voice": has_voice}
+
+
+def _auto_average_samples(hist: list[dict]) -> dict:
+    n = len(hist)
+    return {
+        "noise_db":  sum(m["noise_db"] for m in hist) / n,
+        "voice_db":  sum(m["voice_db"] for m in hist) / n,
+        "peak_db":   sum(m["peak_db"]  for m in hist) / n,
+        "has_voice": sum(1 for m in hist if m["has_voice"]) > n / 2,
+    }
+
+
+def _auto_plan_changes(m: dict) -> list[tuple[str, float, str]]:
+    """Decide what (if anything) to change, with tiny step sizes and wide deadbands.
+    Step size caps are applied here so no origin tracking is required."""
+    changes: list[tuple[str, float, str]] = []
+    current = _load_mic_effects()
+
+    # Ensure effects are on — otherwise auto has nothing to tune
+    if not current["rnnoise"]["enabled"]:
+        changes.append(("rnnoise.enabled", True, "enable rnnoise"))
+    if not current["gate"]["enabled"]:
+        changes.append(("gate.enabled", True, "enable gate"))
+    if not current["compressor"]["enabled"]:
+        changes.append(("compressor.enabled", True, "enable comp"))
+
+    def _step_toward(cur: float, target: float, cap: float) -> float:
+        delta = target - cur
+        return cur + max(-cap, min(cap, delta * 0.3))
+
+    # 1. Gate threshold → noise floor + headroom
+    target_gate = max(-80.0, min(-10.0, m["noise_db"] + _AUTO_GATE_HEADROOM_DB))
+    cur_gate = float(current["gate"]["threshold_db"])
+    if abs(target_gate - cur_gate) > 4.0:
+        new_gate = _step_toward(cur_gate, target_gate, _AUTO_STEP_CAPS["gate.threshold_db"])
+        if abs(new_gate - cur_gate) >= 0.5:
+            changes.append(("gate.threshold_db", round(new_gate, 1), "gate"))
+
+    # 2. RNNoise strength — only on clearly hot/clean rooms
+    if m["noise_db"] > _AUTO_TARGET_NOISE_DB + 8:
+        cur_t = float(current["rnnoise"]["threshold"])
+        if cur_t < 80.0:
+            step = _AUTO_STEP_CAPS["rnnoise.threshold"]
+            changes.append(("rnnoise.threshold", round(min(85.0, cur_t + step), 0), "noisy"))
+    elif m["noise_db"] < _AUTO_TARGET_NOISE_DB - 8:
+        cur_t = float(current["rnnoise"]["threshold"])
+        if cur_t > 35.0:
+            step = _AUTO_STEP_CAPS["rnnoise.threshold"]
+            changes.append(("rnnoise.threshold", round(max(30.0, cur_t - step), 0), "clean"))
+
+    # Voice-based adjustments only if we heard voice
+    if not m["has_voice"]:
+        return changes
+
+    # 3. Compressor makeup → nudge average voice level toward target
+    rms_delta = _AUTO_TARGET_VOICE_DB - m["voice_db"]
+    if abs(rms_delta) > 3.0:
+        cur_m = float(current["compressor"]["makeup_db"])
+        new_m = max(0.0, min(24.0,
+                             cur_m + max(-_AUTO_STEP_CAPS["compressor.makeup_db"],
+                                         min(_AUTO_STEP_CAPS["compressor.makeup_db"],
+                                             rms_delta * 0.3))))
+        if abs(new_m - cur_m) >= 0.5:
+            changes.append(("compressor.makeup_db", round(new_m, 1), "level"))
+
+    # 4. Compressor threshold — catch hot peaks
+    if m["peak_db"] > _AUTO_TARGET_PEAK_DB + 4:
+        cur_thr = float(current["compressor"]["threshold_db"])
+        new_thr = max(-60.0, cur_thr - _AUTO_STEP_CAPS["compressor.threshold_db"])
+        if abs(new_thr - cur_thr) >= 0.5:
+            changes.append(("compressor.threshold_db", round(new_thr, 1), "peaky"))
+
+    return changes
+
+
+def _sonar_mic_pactl(*args, timeout: float = 1.0) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["pactl", *args],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, timeout=timeout,
+    )
+
+
+def _sonar_mic_set_vol(pct: int) -> None:
+    try:
+        _sonar_mic_pactl("set-source-volume", "Sonar_Mic", f"{max(0, min(100, pct))}%")
+    except Exception:
+        pass
+
+
+def _sonar_mic_get_vol_pct() -> int:
+    try:
+        r = _sonar_mic_pactl("get-source-volume", "Sonar_Mic")
+        m = re.search(r"(\d+)%", r.stdout or "")
+        if m:
+            return max(0, min(200, int(m.group(1))))
+    except Exception:
+        pass
+    return 100
+
+
+def _silent_restart_mic_service() -> bool:
+    """Fade Sonar_Mic → 0, restart filter-chain subprocess, mute the new node
+    as soon as it appears, settle, fade back up. Returns True on success,
+    False if the systemctl restart call itself raised."""
+    import time as _time
+
+    original_pct = _sonar_mic_get_vol_pct()
+
+    for pct in (original_pct * 4 // 5, original_pct * 3 // 5,
+                original_pct * 2 // 5, original_pct * 1 // 5, 0):
+        _sonar_mic_set_vol(pct)
+        _time.sleep(0.012)
+
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "reset-failed", "sonar-mic-filterchain.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "restart", "sonar-mic-filterchain.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+        )
+    except Exception as e:
+        print(f"[sonar] silent restart failed: {e}", flush=True)
+        _sonar_mic_set_vol(original_pct)
+        return False
+
+    muted_in_time = False
+    for _ in range(40):
+        _time.sleep(0.020)
+        try:
+            r = _sonar_mic_pactl("set-source-volume", "Sonar_Mic", "0%", timeout=0.5)
+            if r.returncode == 0:
+                muted_in_time = True
+                break
+        except Exception:
+            continue
+
+    if not muted_in_time:
+        _sonar_mic_set_vol(original_pct)
+        return True
+
+    _time.sleep(0.08)
+
+    for pct in (original_pct * 1 // 8, original_pct * 2 // 8,
+                original_pct * 3 // 8, original_pct * 4 // 8,
+                original_pct * 5 // 8, original_pct * 6 // 8,
+                original_pct * 7 // 8, original_pct):
+        _sonar_mic_set_vol(pct)
+        _time.sleep(0.010)
+    _sonar_mic_set_vol(original_pct)
+    return True
+
+
+def _auto_apply_daemon(changes: list[tuple[str, float, str]]) -> None:
+    """Write changes to JSON and trigger a silent restart (daemon path)."""
+    data = _load_mic_effects()
+    for key, value, _reason in changes:
+        effect, field = key.split(".", 1)
+        if effect in data and field in data[effect]:
+            data[effect][field] = value
+    _save_mic_effects(data)
+    _silent_restart_mic_service()
+
+
+def _auto_write_live_status(state: dict) -> None:
+    try:
+        _AUTO_LIVE_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _AUTO_LIVE_STATUS_FILE.write_text(json.dumps(state))
+    except Exception:
+        pass
+
+
+def _auto_read_live_status() -> dict:
+    try:
+        return json.loads(_AUTO_LIVE_STATUS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _daemon_live_auto_thread(stop_event) -> None:
+    """Daemon-side live auto-tune. Polls state, runs the loop when live_enabled.
+    Writes a compact status file every iteration for the GUI to display."""
+    import collections, time as _time
+
+    history        = collections.deque(maxlen=_AUTO_HISTORY_LEN)
+    cooldown_until = 0.0
+    pending        : list[tuple[str, float, str]] = []
+    last_action    : str | None = None
+    last_action_ts : float = 0.0
+    was_on         = False
+
+    while not stop_event.is_set():
+        live_enabled = bool(_get_mic_state_key("live_enabled", False))
+
+        if not live_enabled:
+            if was_on:
+                history.clear()
+                cooldown_until = 0.0
+                pending = []
+                last_action = None
+                _auto_write_live_status({"running": False})
+                was_on = False
+            stop_event.wait(timeout=2.0)
+            continue
+
+        if not was_on:
+            was_on = True
+            print("[sonar-daemon] live auto-tune: enabled", flush=True)
+
+        m = _auto_sample_mic()
+        if m is None:
+            _auto_write_live_status({"running": True, "error": "mic unavailable"})
+            stop_event.wait(timeout=3.0)
+            continue
+
+        history.append(m)
+
+        if len(history) < _AUTO_WARMUP_SAMPLES:
+            _auto_write_live_status({
+                "running": True, "warming_up": True,
+                "warmup_count": len(history),
+                "warmup_total": _AUTO_WARMUP_SAMPLES,
+            })
+            stop_event.wait(timeout=_AUTO_INTERVAL_SEC)
+            continue
+
+        avg = _auto_average_samples(list(history))
+        now = _time.monotonic()
+
+        status = {
+            "running":     True,
+            "warming_up":  False,
+            "noise_db":    round(avg["noise_db"], 1),
+            "voice_db":    round(avg["voice_db"], 1),
+            "peak_db":     round(avg["peak_db"],  1),
+            "has_voice":   avg["has_voice"],
+            "cooldown_remain": max(0, int(cooldown_until - now)),
+        }
+        if last_action and (now - last_action_ts) < _AUTO_ACTION_TOAST_SEC:
+            status["last_action"] = last_action
+        _auto_write_live_status(status)
+
+        if now < cooldown_until:
+            stop_event.wait(timeout=_AUTO_INTERVAL_SEC)
+            continue
+
+        new_changes = _auto_plan_changes(avg)
+        if new_changes:
+            pending = new_changes
+
+        # Apply only if we confirm silence via a fresh short sample
+        if pending:
+            silence_sample = _auto_sample_mic(duration_sec=0.5)
+            if silence_sample and not silence_sample["has_voice"]:
+                reason = pending[0][2] if pending else ""
+                try:
+                    _auto_apply_daemon(pending)
+                except Exception as e:
+                    print(f"[sonar-daemon] auto apply error: {e}", flush=True)
+                pending = []
+                cooldown_until = _time.monotonic() + _AUTO_COOLDOWN_SEC
+                last_action = reason
+                last_action_ts = _time.monotonic()
+
+        stop_event.wait(timeout=_AUTO_INTERVAL_SEC)
+
+
+def _run_daemon() -> int:
+    """
+    Background routing enforcer — no UI.
+    Polls every 1.5 s and applies routing.json prefs to newly connected streams.
+    Runs a ChatMix HID thread for the wheel, and a live auto-tune thread that
+    makes silent mic adjustments whenever _state.live_enabled is true.
+    """
+    import signal
+    import time
+
+    running = True
+
+    def _stop(signum, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    print("[sonar-daemon] waiting for Sonar sinks…", flush=True)
+    while running:
+        status = _run(["wpctl", "status"])
+        sonar_ids = parse_ids(status)
+        if sonar_ids.get("Game") is not None:
+            break
+        time.sleep(2)
+
+    # Shared mutable reference so the ChatMix thread always sees fresh IDs
+    sonar_ids_ref = [sonar_ids]
+
+    chatmix_thread = threading.Thread(
+        target=_chatmix_daemon_thread, args=(sonar_ids_ref,), daemon=True
+    )
+    chatmix_thread.start()
+
+    # Live auto-tune thread — runs continuously, gates on _state.live_enabled
+    live_auto_stop = threading.Event()
+    live_auto_thread = threading.Thread(
+        target=_daemon_live_auto_thread, args=(live_auto_stop,), daemon=True
+    )
+    live_auto_thread.start()
+
+    print("[sonar-daemon] sinks ready, enforcing routing prefs", flush=True)
+    while running:
+        status = _run(["wpctl", "status"])
+        sonar_ids = parse_ids(status)
+        sonar_ids_ref[0] = sonar_ids
+        routing_prefs = load_routing_prefs()
+        if routing_prefs:
+            for sid, name, detected_channel, _role in get_active_streams(sonar_ids):
+                if name in routing_prefs:
+                    preferred = routing_prefs[name]
+                    if preferred != detected_channel:
+                        move_stream(sid, preferred)
+        time.sleep(1.5)
+
+    live_auto_stop.set()
+    return 0
+
+
+if "--write-mic-config" in sys.argv:
+    # Bootstrap: generate the mic filter-chain config file from the current
+    # JSON settings (or defaults if no settings exist). Called by the
+    # systemd ExecStartPre so the service never starts with a missing file.
+    _write_mic_filter_chain()
+    sys.exit(0)
+
+
+if "--set-mic-input" in sys.argv:
+    # CLI used by the waybar discord-mic swapper. Switches the filter-chain
+    # input between hyperx / arctis.
+    #
+    # Preferred path: live-relink Sonar_Mic_in to the new mic via
+    # pactl move-source-output. This keeps the filter-chain process alive so
+    # Sonar_Mic never disappears from the PipeWire graph — Discord's
+    # source-output stays connected throughout and WirePlumber has nothing to
+    # auto-reroute, which prevents the duplicate-source-output double-audio bug.
+    #
+    # Fallback: service restart (original behaviour), used only when
+    # Sonar_Mic_in isn't found (e.g. the filter-chain service isn't running).
+    try:
+        i = sys.argv.index("--set-mic-input")
+        name = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+    except (ValueError, IndexError):
+        name = ""
+    if name not in _MIC_INPUT_TARGETS:
+        print(f"usage: sonar-mixer --set-mic-input <{'|'.join(_MIC_INPUT_TARGETS)}>",
+              file=sys.stderr)
+        sys.exit(2)
+    _set_mic_state_key("mic_input", name)
+    _write_mic_filter_chain()
+
+    # Try live relink first.
+    new_target = _MIC_INPUT_TARGETS[name]
+    _live_relinked = False
+    try:
+        _so_raw = subprocess.run(
+            ["pactl", "list", "source-outputs"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+        _so_id = None
+        for _line in _so_raw.splitlines():
+            if _line.startswith("Source Output #"):
+                _so_id = _line.split("#")[1].strip()
+            elif '"Sonar_Mic_in"' in _line and _so_id is not None:
+                break
+        else:
+            _so_id = None
+        if _so_id is not None:
+            _r = subprocess.run(
+                ["pactl", "move-source-output", _so_id, new_target],
+                capture_output=True, timeout=2,
+            )
+            _live_relinked = _r.returncode == 0
+    except Exception:
+        pass
+
+    if _live_relinked:
+        print(f"mic input → {name}")
+        sys.exit(0)
+
+    # Fallback: restart the service (Sonar_Mic_in not found or move failed).
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "reset-failed", "sonar-mic-filterchain.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "restart", "sonar-mic-filterchain.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+        )
+    except Exception as e:
+        print(f"failed to restart service: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"mic input → {name}")
+    sys.exit(0)
+
+
+if "--daemon" in sys.argv:
+    sys.exit(_run_daemon())
+
+
+# ---------------------------------------------------------------------------
+# Channel metadata
+# ---------------------------------------------------------------------------
+
+CHANNELS = ["Game", "Chat", "Media", "AUX", "VoiceChat"]
+
+CHANNEL_META: dict[str, dict] = {
+    "Game":      {"color": "#4a9eff", "icon": "🎮"},
+    "Chat":      {"color": "#a855f7", "icon": "💬"},
+    "Media":     {"color": "#22c55e", "icon": "🎵"},
+    "AUX":       {"color": "#f59e0b", "icon": "🎸"},
+    "VoiceChat": {"color": "#ef4444", "icon": "🎧"},
+    "Mic":       {"color": "#ec4899", "icon": "🎤"},
+}
+
+
+# ---------------------------------------------------------------------------
+# Channel strip
+# ---------------------------------------------------------------------------
+
+class ChannelStrip(Gtk.Box):
+    def __init__(self, name: str, node_id: int | None) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.name = name
+        self.node_id = node_id
+        self._suppress = False
+        self._chatmix_ref = None  # set by SonarMixerWindow._populate for Game/Chat strips
+
+        meta = CHANNEL_META.get(name, {"color": "#888", "icon": ""})
+        self._color = meta["color"]
+
+        self.add_css_class("channel-strip")
+        self.add_css_class(f"channel-{name.lower()}")
+
+        self.set_size_request(90, -1)
+        self.set_margin_start(2)
+        self.set_margin_end(2)
+
+        # Colored accent bar
+        accent = Gtk.Box()
+        accent.set_size_request(-1, 3)
+        accent.add_css_class(f"accent-{name.lower()}")
+        accent.set_margin_bottom(8)
+        self.append(accent)
+
+        # Channel name
+        lbl = Gtk.Label()
+        lbl.set_markup(
+            f'<span foreground="{self._color}" weight="bold" size="x-small"'
+            f' letter_spacing="1200">{name.upper()}</span>'
+        )
+        lbl.set_halign(Gtk.Align.CENTER)
+        lbl.set_margin_bottom(6)
+        self.append(lbl)
+
+        if node_id is None:
+            u = Gtk.Label()
+            u.set_markup('<span foreground="#555" size="x-small">unavailable</span>')
+            u.set_halign(Gtk.Align.CENTER)
+            self.append(u)
+            self._adj = self._pct_label = self._mute_btn = None
+            return
+
+        # Slider
+        self._adj = Gtk.Adjustment(value=1.0, lower=0.0, upper=1.5,
+                                   step_increment=0.01, page_increment=0.1)
+        slider = Gtk.Scale(orientation=Gtk.Orientation.VERTICAL, adjustment=self._adj)
+        slider.set_inverted(True)
+        slider.set_draw_value(False)
+        slider.set_vexpand(True)
+        slider.set_size_request(-1, 220)
+        self._adj.connect("value-changed", self._on_value_changed)
+        self.append(slider)
+
+        # Percentage — stack switches between label (display) and entry (edit)
+        self._pct_stack = Gtk.Stack()
+        self._pct_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        self._pct_stack.set_halign(Gtk.Align.CENTER)
+        self._pct_stack.set_margin_top(4)
+        self._pct_stack.set_margin_bottom(6)
+
+        self._pct_label = Gtk.Label()
+        self._pct_label.add_css_class("vol-label")
+        self._pct_label.set_cursor(Gdk.Cursor.new_from_name("pointer"))
+        self._pct_label.set_tooltip_text("Click to set volume")
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect("pressed", self._on_pct_clicked)
+        self._pct_label.add_controller(click)
+        self._pct_stack.add_named(self._pct_label, "label")
+
+        self._pct_entry = Gtk.Entry()
+        self._pct_entry.set_width_chars(5)
+        self._pct_entry.set_max_width_chars(5)
+        self._pct_entry.set_input_purpose(Gtk.InputPurpose.NUMBER)
+        self._pct_entry.connect("activate", self._on_pct_entry_activate)
+        focus_ctrl = Gtk.EventControllerFocus()
+        focus_ctrl.connect("leave", self._on_pct_entry_activate)
+        self._pct_entry.add_controller(focus_ctrl)
+        key_ctrl = Gtk.EventControllerKey()
+        key_ctrl.connect("key-pressed", self._on_pct_key)
+        self._pct_entry.add_controller(key_ctrl)
+        self._pct_stack.add_named(self._pct_entry, "entry")
+
+        self._pct_stack.set_visible_child_name("label")
+        self.append(self._pct_stack)
+
+        # Mute button
+        self._mute_btn = Gtk.ToggleButton()
+        self._mute_btn.set_icon_name("audio-volume-high-symbolic")
+        self._mute_btn.set_tooltip_text("Mute / Unmute")
+        self._mute_btn.set_halign(Gtk.Align.FILL)
+        self._mute_btn.set_margin_start(8)
+        self._mute_btn.set_margin_end(8)
+        self._mute_btn.set_margin_bottom(10)
+        self._mute_btn.add_css_class("mute-btn")
+        self._mute_btn.connect("toggled", self._on_mute_toggled)
+        self.append(self._mute_btn)
+
+        self._load_state()
+
+    def _load_state(self) -> None:
+        if self.node_id is None:
+            return
+        vol, muted = get_volume(self.node_id)
+        self._suppress = True
+        self._adj.set_value(vol)
+        self._update_pct(vol)
+        self._suppress = False
+        self._mute_btn.handler_block_by_func(self._on_mute_toggled)
+        self._mute_btn.set_active(muted)
+        self._update_mute(muted)
+        self._mute_btn.handler_unblock_by_func(self._on_mute_toggled)
+
+    def _update_pct(self, v: float) -> None:
+        self._pct_label.set_markup(
+            f'<span foreground="{self._color}">'
+            f'{int(round(v * 100))}%</span>'
+        )
+
+    def _update_mute(self, muted: bool) -> None:
+        if muted:
+            self._mute_btn.set_icon_name("audio-volume-muted-symbolic")
+            self._mute_btn.add_css_class("muted")
+        else:
+            self._mute_btn.set_icon_name("audio-volume-high-symbolic")
+            self._mute_btn.remove_css_class("muted")
+
+    def _on_value_changed(self, adj: Gtk.Adjustment) -> None:
+        if self._suppress or self.node_id is None:
+            return
+        v = adj.get_value()
+        self._update_pct(v)
+        set_volume(self.node_id, v)
+        if self.name in ("Game", "Chat"):
+            _update_chatmix_base(self.name.lower(), v)
+            if self._chatmix_ref is not None:
+                self._chatmix_ref.update_base(self.name.lower(), v)
+
+    def _on_mute_toggled(self, btn: Gtk.ToggleButton) -> None:
+        if self.node_id is None:
+            return
+        muted = btn.get_active()
+        self._update_mute(muted)
+        set_mute(self.node_id, muted)
+
+    def _on_pct_clicked(self, _gesture, _n_press, _x, _y) -> None:
+        self._pct_entry.set_text(str(int(round(self._adj.get_value() * 100))))
+        self._pct_stack.set_visible_child_name("entry")
+        self._pct_entry.grab_focus()
+        self._pct_entry.select_region(0, -1)
+
+    def _on_pct_entry_activate(self, *_) -> None:
+        if self._pct_stack.get_visible_child_name() != "entry":
+            return
+        self._pct_stack.set_visible_child_name("label")
+        try:
+            pct = max(0, min(150, int(self._pct_entry.get_text().strip().rstrip('%'))))
+        except ValueError:
+            return
+        v = pct / 100.0
+        self._suppress = True
+        self._adj.set_value(v)
+        self._suppress = False
+        self._update_pct(v)
+        if self.node_id:
+            set_volume(self.node_id, v)
+
+    def _on_pct_key(self, _ctrl, keyval, _keycode, _state) -> bool:
+        if keyval == Gdk.KEY_Escape:
+            self._pct_stack.set_visible_child_name("label")
+            return True
+        return False
+
+    def refresh(self) -> None:
+        self._load_state()
+
+
+# ---------------------------------------------------------------------------
+# ChatMix strip — balance slider between Game and Chat channels
+# ---------------------------------------------------------------------------
+
+class ChatMixStrip(Gtk.Box):
+    """
+    Horizontal slider replicating SteelSeries ChatMix wheel.
+    Left = Chat-focused (reduces Game volume).
+    Right = Game-focused (reduces Chat volume).
+    Center = balanced (both at 100 %).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._game_id: int | None = None
+        self._chat_id: int | None = None
+        self._game_strip = None
+        self._chat_strip = None
+        self._base_game: float = 1.0
+        self._base_chat: float = 1.0
+        self._suppress = False
+
+        self.set_margin_start(14)
+        self.set_margin_end(14)
+        self.set_margin_top(6)
+        self.set_margin_bottom(6)
+
+        # Header row
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        icon = Gtk.Image.new_from_icon_name("audio-headphones-symbolic")
+        icon.set_pixel_size(14)
+        icon.set_opacity(0.5)
+        row.append(icon)
+        lbl = Gtk.Label()
+        lbl.set_markup('<span foreground="#555555" size="x-small" weight="bold" letter_spacing="1200">CHATMIX</span>')
+        lbl.set_halign(Gtk.Align.START)
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        self._val_lbl = Gtk.Label()
+        self._val_lbl.set_markup('<span foreground="#555" size="x-small">balanced</span>')
+        row.append(self._val_lbl)
+        self.append(row)
+
+        # Slider row
+        slider_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        chat_lbl = Gtk.Label()
+        chat_lbl.set_markup('<span foreground="#a855f7" size="x-small" weight="bold">CHAT</span>')
+        slider_row.append(chat_lbl)
+
+        self._adj = Gtk.Adjustment(value=0.0, lower=-1.0, upper=1.0,
+                                   step_increment=0.05, page_increment=0.25)
+        slider = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self._adj)
+        slider.set_draw_value(False)
+        slider.set_hexpand(True)
+        slider.add_mark(-1.0, Gtk.PositionType.BOTTOM, None)
+        slider.add_mark( 0.0, Gtk.PositionType.BOTTOM, None)
+        slider.add_mark( 1.0, Gtk.PositionType.BOTTOM, None)
+        self._adj.connect("value-changed", self._on_changed)
+        slider_row.append(slider)
+
+        game_lbl = Gtk.Label()
+        game_lbl.set_markup('<span foreground="#4a9eff" size="x-small" weight="bold">GAME</span>')
+        slider_row.append(game_lbl)
+
+        self.append(slider_row)
+
+    def set_channel_ids(self, game_id: int | None, chat_id: int | None,
+                        game_strip=None, chat_strip=None) -> None:
+        self._game_id = game_id
+        self._chat_id = chat_id
+        self._game_strip = game_strip
+        self._chat_strip = chat_strip
+        # Load base from file (authoritative source of user intent).
+        # If no file exists yet (first run), bootstrap from current strip adj
+        # (which reflects pactl before any chatmix has been applied) and save.
+        if _CHATMIX_BASE_FILE.exists():
+            file_game, file_chat = _load_chatmix_base()
+        else:
+            file_game = game_strip._adj.get_value() if game_strip else 1.0
+            file_chat = chat_strip._adj.get_value() if chat_strip else 1.0
+            _save_chatmix_base(file_game, file_chat)
+        self._base_game = file_game
+        self._base_chat = file_chat
+        # Correct the strip display to show user-intended volume, not the
+        # WirePlumber-persisted chatmix-scaled value.
+        if game_strip:
+            game_strip._suppress = True
+            game_strip._adj.set_value(self._base_game)
+            game_strip._update_pct(self._base_game)
+            game_strip._suppress = False
+            game_strip._chatmix_ref = self
+        if chat_strip:
+            chat_strip._suppress = True
+            chat_strip._adj.set_value(self._base_chat)
+            chat_strip._update_pct(self._base_chat)
+            chat_strip._suppress = False
+            chat_strip._chatmix_ref = self
+
+    def update_base(self, channel: str, value: float) -> None:
+        """Called by ChannelStrip when user moves Game/Chat slider."""
+        if channel == "game":
+            self._base_game = value
+        elif channel == "chat":
+            self._base_chat = value
+
+    def is_centered(self) -> bool:
+        return abs(self._adj.get_value()) < 0.01
+
+    def _on_changed(self, adj: Gtk.Adjustment) -> None:
+        if self._suppress:
+            return
+        v = adj.get_value()
+        if v <= 0:
+            game_mult = 1.0 + v          # 0 → 1 as v goes -1 → 0
+            chat_mult = 1.0
+        else:
+            game_mult = 1.0
+            chat_mult = 1.0 - v          # 1 → 0 as v goes 0 → 1
+
+        if self._game_id:
+            set_volume(self._game_id, self._base_game * game_mult)
+        if self._chat_id:
+            set_volume(self._chat_id, self._base_chat * chat_mult)
+
+        if abs(v) < 0.05:
+            label = "balanced"
+        elif v < 0:
+            label = f"chat +{int(abs(v)*100)}%"
+        else:
+            label = f"game +{int(v*100)}%"
+        self._val_lbl.set_markup(f'<span foreground="#555" size="x-small">{label}</span>')
+
+    def reset(self) -> None:
+        self._suppress = True
+        self._adj.set_value(0.0)
+        self._suppress = False
+        self._val_lbl.set_markup('<span foreground="#555" size="x-small">balanced</span>')
+
+    def set_from_hw(self, game_val: int, chat_val: int) -> None:
+        """Called from the HID reader thread (via GLib.idle_add) with raw HW values 0-100."""
+        # _base_* is authoritative (loaded from file at set_channel_ids, updated by
+        # update_base() when user moves a strip slider). Never re-read from strip adj
+        # or pactl here — those may hold scaled values.
+        game_mult = game_val / 100.0
+        chat_mult = chat_val / 100.0
+
+        if self._game_id:
+            set_volume(self._game_id, self._base_game * game_mult)
+        if self._chat_id:
+            set_volume(self._chat_id, self._base_chat * chat_mult)
+
+        # Update slider position for visual feedback (suppressed so _on_changed doesn't re-apply)
+        self._suppress = True
+        if game_val < 100:
+            v = game_val / 100.0 - 1.0   # -1..0 (chat-focused)
+        elif chat_val < 100:
+            v = 1.0 - chat_val / 100.0   # 0..1 (game-focused)
+        else:
+            v = 0.0
+        self._adj.set_value(v)
+        self._suppress = False
+
+        if abs(v) < 0.05:
+            label = "balanced"
+        elif v < 0:
+            label = f"chat +{int(abs(v)*100)}%"
+        else:
+            label = f"game +{int(v*100)}%"
+        self._val_lbl.set_markup(f'<span foreground="#555" size="x-small">{label}</span>')
+
+
+# ---------------------------------------------------------------------------
+# Mic effects panel — SteelSeries Sonar-style mic processing
+# ---------------------------------------------------------------------------
+
+# EQ band layout: (key, display label)
+_EQ_BANDS = [
+    ("ls", "LS"),
+    ("p1", "250"),
+    ("p2", "1k"),
+    ("p3", "3k"),
+    ("p4", "8k"),
+    ("hs", "HS"),
+]
+
+_MIC_COLOR = "#ec4899"  # matches CHANNEL_META["Mic"]
+
+
+class _EffectRow(Gtk.Box):
+    """
+    Collapsible effect row — SteelSeries Sonar style.
+    When collapsed: single thin row with [checkbox] [TITLE] [preview] [chevron].
+    When expanded: chevron rotates, body reveals below with sliders.
+    """
+
+    def __init__(self, title: str, on_toggle_cb, on_change_cb, initial_enabled: bool,
+                 header_tooltip: str | None = None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._on_change_cb = on_change_cb
+        self._on_toggle_cb = on_toggle_cb
+        self._suppress = False
+        self._expanded = False
+        self._preview_text = ""
+        self._header_tooltip_text = header_tooltip
+        self.add_css_class("mic-effect-row")
+
+        # ── Header row ─────────────────────────────────────────────────────
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header.set_margin_top(3)
+        header.set_margin_bottom(3)
+        header.set_margin_start(4)
+        header.set_margin_end(4)
+
+        # Checkbox — handles its own clicks natively
+        self._enable = Gtk.CheckButton()
+        self._enable.set_active(initial_enabled)
+        if header_tooltip:
+            self._enable.set_tooltip_text(header_tooltip)
+        self._enable.connect("toggled", self._on_enable_toggled, on_toggle_cb)
+        header.append(self._enable)
+
+        # Title + preview grouped in a clickable inner box (the expand target)
+        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        title_box.set_hexpand(True)
+        title_box.add_css_class("mic-row-header")
+        title_box.set_cursor(Gdk.Cursor.new_from_name("pointer"))
+
+        self._title_lbl = Gtk.Label()
+        self._title_lbl.set_markup(
+            f'<span foreground="{_MIC_COLOR}" size="x-small" weight="bold"'
+            f' letter_spacing="1200">{title}</span>'
+        )
+        self._title_lbl.set_halign(Gtk.Align.START)
+        title_box.append(self._title_lbl)
+
+        self._preview_lbl = Gtk.Label()
+        self._preview_lbl.set_halign(Gtk.Align.START)
+        self._preview_lbl.set_hexpand(True)
+        title_box.append(self._preview_lbl)
+
+        if header_tooltip:
+            title_box.set_tooltip_text(header_tooltip)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect("pressed", self._on_header_clicked)
+        title_box.add_controller(click)
+        header.append(title_box)
+
+        # Chevron — a tiny flat button so it's also clickable
+        self._chevron_btn = Gtk.Button()
+        self._chevron_btn.add_css_class("flat")
+        self._chevron_btn.add_css_class("mic-chevron")
+        self._chevron_btn.set_icon_name("pan-end-symbolic")
+        self._chevron_btn.connect("clicked", lambda _b: self._on_header_clicked(None, 0, 0, 0))
+        header.append(self._chevron_btn)
+
+        self.append(header)
+
+        # ── Revealer wraps the body (slider rows) ─────────────────────────
+        self._revealer = Gtk.Revealer()
+        self._revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self._revealer.set_reveal_child(False)
+
+        self._body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._body.set_margin_start(24)
+        self._body.set_margin_end(4)
+        self._body.set_margin_top(2)
+        self._body.set_margin_bottom(4)
+        self._revealer.set_child(self._body)
+        self.append(self._revealer)
+
+        self._apply_enabled(initial_enabled)
+
+    def set_preview(self, text: str) -> None:
+        self._preview_text = text
+        color = "#888" if self._enable.get_active() else "#444"
+        self._preview_lbl.set_markup(
+            f'<span foreground="{color}" size="x-small">{text}</span>'
+        )
+
+    def _apply_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._body.remove_css_class("disabled")
+            self._body.set_sensitive(True)
+            self._title_lbl.set_opacity(1.0)
+        else:
+            self._body.add_css_class("disabled")
+            self._body.set_sensitive(False)
+            self._title_lbl.set_opacity(0.5)
+        # Refresh preview color
+        self.set_preview(self._preview_text)
+
+    def _on_enable_toggled(self, btn, cb):
+        if self._suppress:
+            return
+        active = btn.get_active()
+        self._apply_enabled(active)
+        cb(active)
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Programmatically set the enable state without firing the callback."""
+        self._suppress = True
+        self._enable.set_active(enabled)
+        self._apply_enabled(enabled)
+        self._suppress = False
+
+    def _on_header_clicked(self, _gesture, _n_press=None, _x=None, _y=None) -> None:
+        self._expanded = not self._expanded
+        self._revealer.set_reveal_child(self._expanded)
+        self._chevron_btn.set_icon_name(
+            "pan-down-symbolic" if self._expanded else "pan-end-symbolic"
+        )
+
+    def add_slider(self, label: str, lower: float, upper: float, value: float,
+                   step: float, key: str, unit: str = "", precision: int = 0,
+                   tooltip: str | None = None):
+        """Append a labeled horizontal slider. Returns (adjustment, formatter)."""
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.add_css_class("mic-slider-row")
+        if tooltip:
+            row.set_tooltip_text(tooltip)
+
+        lbl = Gtk.Label(label=label)
+        lbl.set_halign(Gtk.Align.START)
+        lbl.set_size_request(60, -1)
+        lbl.add_css_class("mic-slider-label")
+        row.append(lbl)
+
+        adj = Gtk.Adjustment(value=value, lower=lower, upper=upper,
+                             step_increment=step, page_increment=step * 10)
+        scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj)
+        scale.set_draw_value(False)
+        scale.set_hexpand(True)
+        scale.add_css_class("mic-slider")
+        row.append(scale)
+
+        val_lbl = Gtk.Label()
+        val_lbl.set_size_request(48, -1)
+        val_lbl.set_halign(Gtk.Align.END)
+        val_lbl.add_css_class("mic-slider-value")
+
+        def fmt(v):
+            return f"{v:.{precision}f}{unit}"
+
+        val_lbl.set_markup(f'<span foreground="#888" size="x-small">{fmt(value)}</span>')
+        row.append(val_lbl)
+
+        def on_changed(a):
+            if self._suppress:
+                return
+            v = a.get_value()
+            val_lbl.set_markup(f'<span foreground="#888" size="x-small">{fmt(v)}</span>')
+            self._on_change_cb(key, v)
+
+        adj.connect("value-changed", on_changed)
+        self._body.append(row)
+        # Return a setter that updates both slider + displayed value without firing the callback
+        def setter(new_val: float):
+            self._suppress = True
+            adj.set_value(new_val)
+            val_lbl.set_markup(f'<span foreground="#888" size="x-small">{fmt(new_val)}</span>')
+            self._suppress = False
+        return adj, fmt, setter
+
+
+class MicEffectsPanel(Gtk.Box):
+    """
+    Collapsible mic processing panel — replicates SteelSeries Sonar mic effects.
+    Writes to mic-effects.json and debounces a filter-chain reload on each change.
+    """
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.set_margin_start(14)
+        self.set_margin_end(14)
+        self.set_margin_top(4)
+        self.set_margin_bottom(6)
+        self.add_css_class("mic-effects")
+
+        self._reload_timeout_id: int | None = None
+        self._suppress = False
+        self._preset_suppress = True   # block preset dropdown until init complete
+        self._reload_wait_start = 0.0  # for deferral timeout tracking
+        self._live_poll_id: int | None = None   # GLib timeout id for daemon status poll
+
+        # Always-on voice activity detection — used to avoid reloading the
+        # filter-chain while the user is mid-sentence (which causes a brief
+        # click/pop as the PipeWire graph restructures).
+        self._currently_speaking = False
+        self._last_speech_time = 0.0
+        self._vad_stop_event = threading.Event()
+        threading.Thread(target=self._vad_worker, daemon=True).start()
+
+        effects = _load_mic_effects()
+
+        # ── Header row ────────────────────────────────────────────────────
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
+        icon.set_pixel_size(14)
+        icon.set_opacity(0.5)
+        header.append(icon)
+
+        lbl = Gtk.Label()
+        lbl.set_markup(
+            '<span foreground="#555555" size="x-small" weight="bold"'
+            ' letter_spacing="1200">MIC EFFECTS</span>'
+        )
+        lbl.set_halign(Gtk.Align.START)
+        header.append(lbl)
+
+        # Default-source toggle button — one-click swap between processed
+        # Sonar_Mic and raw HW mic as the system default input
+        self._default_btn = Gtk.ToggleButton()
+        self._default_btn.add_css_class("mic-default-toggle")
+        self._default_btn.set_label("SET AS DEFAULT")
+        self._default_btn.connect("toggled", self._on_default_toggled)
+        header.append(self._default_btn)
+
+        # Live auto-tune toggle — always-on silent background refinement.
+        # Continuously monitors the mic and makes small adjustments ONLY during
+        # silence so no one on the other end hears the changes. Persistent.
+        self._auto_btn = Gtk.ToggleButton()
+        self._auto_btn.add_css_class("mic-live-toggle")
+        self._auto_btn.set_label("LIVE")
+        self._auto_btn.set_tooltip_text(
+            "Live auto-tune: silently refines your mic settings in the background.\n"
+            "Makes tiny adjustments to gate / compressor / noise reduction as\n"
+            "conditions change. Updates only apply during silence so nobody on\n"
+            "the other end hears them. Setting survives reboot — click once\n"
+            "and leave it on."
+        )
+        self._auto_running = False
+        self._auto_btn.connect("toggled", self._on_auto_toggled)
+        header.append(self._auto_btn)
+
+        # Preset dropdown (built-in + custom user presets)
+        self._preset_model = Gtk.StringList.new(_all_preset_names())
+        self._preset_dd = Gtk.DropDown(model=self._preset_model)
+        self._preset_dd.add_css_class("mic-preset-dropdown")
+        self._preset_dd.set_tooltip_text("Apply a ready-made or saved mic setup")
+        self._preset_dd.set_hexpand(True)
+        self._preset_dd.set_halign(Gtk.Align.END)
+        self._preset_dd.connect("notify::selected", self._on_preset_selected)
+        header.append(self._preset_dd)
+
+        # Save current settings as a custom preset
+        self._save_btn = Gtk.Button()
+        self._save_btn.set_icon_name("document-save-symbolic")
+        self._save_btn.add_css_class("flat")
+        self._save_btn.set_tooltip_text("Save current settings as a custom preset")
+        self._save_btn.connect("clicked", self._on_save_preset_clicked)
+        header.append(self._save_btn)
+
+        # Delete currently-selected custom preset (disabled for built-ins)
+        self._delete_btn = Gtk.Button()
+        self._delete_btn.set_icon_name("user-trash-symbolic")
+        self._delete_btn.add_css_class("flat")
+        self._delete_btn.set_tooltip_text("Delete the selected custom preset")
+        self._delete_btn.set_sensitive(False)
+        self._delete_btn.connect("clicked", self._on_delete_preset_clicked)
+        header.append(self._delete_btn)
+
+        # Reset button
+        self._reset_btn = Gtk.Button()
+        self._reset_btn.set_icon_name("edit-undo-symbolic")
+        self._reset_btn.add_css_class("flat")
+        self._reset_btn.set_tooltip_text("Reset all mic effects to defaults")
+        self._reset_btn.connect("clicked", self._on_reset_clicked)
+        header.append(self._reset_btn)
+
+        self._status_lbl = Gtk.Label()
+        self._status_lbl.set_markup('<span foreground="#555" size="x-small"></span>')
+        header.append(self._status_lbl)
+
+        self._collapse_btn = Gtk.Button()
+        self._collapse_btn.set_icon_name("pan-down-symbolic")
+        self._collapse_btn.add_css_class("flat")
+        self._collapse_btn.set_tooltip_text("Collapse panel")
+        self._collapse_btn.connect("clicked", self._on_collapse_toggle)
+        header.append(self._collapse_btn)
+
+        self.append(header)
+
+        # ── Revealer wraps the effect rows so the whole panel can collapse ─
+        self._revealer = Gtk.Revealer()
+        self._revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self._revealer.set_reveal_child(True)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        body.set_margin_top(2)
+
+        # Setters map so we can refresh UI from JSON after presets/reset
+        self._setters: dict[str, callable] = {}
+
+        # ── Noise Reduction ────────────────────────────────────────────────
+        self._rnnoise_row = _EffectRow(
+            "NOISE REDUCTION",
+            on_toggle_cb=lambda active: self._on_enable("rnnoise", active),
+            on_change_cb=lambda key, v: self._on_change("rnnoise", key, v),
+            initial_enabled=effects["rnnoise"]["enabled"],
+            header_tooltip=_MIC_TOOLTIPS["rnnoise.enabled"],
+        )
+        _, _, set_rnnoise = self._rnnoise_row.add_slider(
+            "Strength", 0.0, 100.0, effects["rnnoise"]["threshold"],
+            1.0, "threshold", unit="%", precision=0,
+            tooltip=_MIC_TOOLTIPS["rnnoise.threshold"],
+        )
+        self._setters["rnnoise.threshold"] = set_rnnoise
+        body.append(self._rnnoise_row)
+
+        # ── Noise Gate ─────────────────────────────────────────────────────
+        self._gate_row = _EffectRow(
+            "NOISE GATE",
+            on_toggle_cb=lambda active: self._on_enable("gate", active),
+            on_change_cb=lambda key, v: self._on_change("gate", key, v),
+            initial_enabled=effects["gate"]["enabled"],
+            header_tooltip=_MIC_TOOLTIPS["gate.enabled"],
+        )
+        _, _, s = self._gate_row.add_slider("Threshold", -80.0, 0.0, effects["gate"]["threshold_db"],
+                                            1.0, "threshold_db", unit=" dB", precision=0,
+                                            tooltip=_MIC_TOOLTIPS["gate.threshold_db"])
+        self._setters["gate.threshold_db"] = s
+        _, _, s = self._gate_row.add_slider("Attack", 0.1, 500.0, effects["gate"]["attack"],
+                                            1.0, "attack", unit=" ms", precision=0,
+                                            tooltip=_MIC_TOOLTIPS["gate.attack"])
+        self._setters["gate.attack"] = s
+        _, _, s = self._gate_row.add_slider("Release", 1.0, 2000.0, effects["gate"]["release"],
+                                            1.0, "release", unit=" ms", precision=0,
+                                            tooltip=_MIC_TOOLTIPS["gate.release"])
+        self._setters["gate.release"] = s
+        _, _, s = self._gate_row.add_slider("Ratio", 1.0, 20.0, effects["gate"]["ratio"],
+                                            0.1, "ratio", unit="", precision=1,
+                                            tooltip=_MIC_TOOLTIPS["gate.ratio"])
+        self._setters["gate.ratio"] = s
+        body.append(self._gate_row)
+
+        # ── Equalizer (compact horizontal band row) ────────────────────────
+        self._eq_row = _EffectRow(
+            "EQUALIZER",
+            on_toggle_cb=lambda active: self._on_enable("eq", active),
+            on_change_cb=lambda key, v: None,   # bands handled separately
+            initial_enabled=effects["eq"]["enabled"],
+            header_tooltip=_MIC_TOOLTIPS["eq.enabled"],
+        )
+        self._eq_adjs: list[Gtk.Adjustment] = []
+        eq_bands_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        eq_bands_row.set_halign(Gtk.Align.FILL)
+        eq_bands_row.set_hexpand(True)
+        eq_bands_row.set_margin_top(2)
+        eq_bands_row.set_margin_bottom(2)
+        for i, (band_key, display) in enumerate(_EQ_BANDS):
+            band_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            band_col.set_hexpand(True)
+            band_col.add_css_class("mic-eq-band-col")
+
+            adj = Gtk.Adjustment(
+                value=effects["eq"]["bands"][i]["gain_db"],
+                lower=-12.0, upper=12.0,
+                step_increment=0.5, page_increment=2.0,
+            )
+            scale = Gtk.Scale(orientation=Gtk.Orientation.VERTICAL, adjustment=adj)
+            scale.set_inverted(True)
+            scale.set_draw_value(False)
+            scale.set_size_request(-1, 56)
+            scale.set_vexpand(False)
+            scale.add_css_class("mic-eq-band")
+            scale.add_mark(0.0, Gtk.PositionType.RIGHT, None)
+            scale.set_tooltip_text(_MIC_TOOLTIPS["eq.band"])
+            band_col.append(scale)
+
+            band_lbl = Gtk.Label()
+            band_lbl.set_markup(f'<span foreground="#666" size="x-small">{display}</span>')
+            band_lbl.set_halign(Gtk.Align.CENTER)
+            band_col.append(band_lbl)
+
+            idx = i
+            def make_cb(index):
+                def cb(a):
+                    if self._suppress:
+                        return
+                    _update_mic_effect("eq", "band", (index, a.get_value()))
+                    self._refresh_preview("eq")
+                    self._schedule_reload()
+                return cb
+            adj.connect("value-changed", make_cb(idx))
+
+            self._eq_adjs.append(adj)
+            eq_bands_row.append(band_col)
+        self._eq_row._body.append(eq_bands_row)
+        body.append(self._eq_row)
+
+        # ── Compressor ─────────────────────────────────────────────────────
+        self._comp_row = _EffectRow(
+            "COMPRESSOR",
+            on_toggle_cb=lambda active: self._on_enable("compressor", active),
+            on_change_cb=lambda key, v: self._on_change("compressor", key, v),
+            initial_enabled=effects["compressor"]["enabled"],
+            header_tooltip=_MIC_TOOLTIPS["compressor.enabled"],
+        )
+        _, _, s = self._comp_row.add_slider("Threshold", -60.0, 0.0, effects["compressor"]["threshold_db"],
+                                            1.0, "threshold_db", unit=" dB", precision=0,
+                                            tooltip=_MIC_TOOLTIPS["compressor.threshold_db"])
+        self._setters["compressor.threshold_db"] = s
+        _, _, s = self._comp_row.add_slider("Ratio", 1.0, 20.0, effects["compressor"]["ratio"],
+                                            0.1, "ratio", unit=":1", precision=1,
+                                            tooltip=_MIC_TOOLTIPS["compressor.ratio"])
+        self._setters["compressor.ratio"] = s
+        _, _, s = self._comp_row.add_slider("Attack", 0.1, 500.0, effects["compressor"]["attack"],
+                                            1.0, "attack", unit=" ms", precision=0,
+                                            tooltip=_MIC_TOOLTIPS["compressor.attack"])
+        self._setters["compressor.attack"] = s
+        _, _, s = self._comp_row.add_slider("Release", 1.0, 2000.0, effects["compressor"]["release"],
+                                            1.0, "release", unit=" ms", precision=0,
+                                            tooltip=_MIC_TOOLTIPS["compressor.release"])
+        self._setters["compressor.release"] = s
+        _, _, s = self._comp_row.add_slider("Makeup", 0.0, 24.0, effects["compressor"]["makeup_db"],
+                                            0.5, "makeup_db", unit=" dB", precision=1,
+                                            tooltip=_MIC_TOOLTIPS["compressor.makeup_db"])
+        self._setters["compressor.makeup_db"] = s
+        body.append(self._comp_row)
+
+        # ── Limiter ────────────────────────────────────────────────────────
+        self._limiter_row = _EffectRow(
+            "LIMITER",
+            on_toggle_cb=lambda active: self._on_enable("limiter", active),
+            on_change_cb=lambda key, v: self._on_change("limiter", key, v),
+            initial_enabled=effects["limiter"]["enabled"],
+            header_tooltip=_MIC_TOOLTIPS["limiter.enabled"],
+        )
+        _, _, s = self._limiter_row.add_slider("Ceiling", -20.0, 0.0, effects["limiter"]["ceiling_db"],
+                                               0.1, "ceiling_db", unit=" dB", precision=1,
+                                               tooltip=_MIC_TOOLTIPS["limiter.ceiling_db"])
+        self._setters["limiter.ceiling_db"] = s
+        body.append(self._limiter_row)
+
+        self._revealer.set_child(body)
+        self.append(self._revealer)
+
+        # Initialize all preview strings
+        for k in ("rnnoise", "gate", "eq", "compressor", "limiter"):
+            self._refresh_preview(k)
+
+        # Restore the last active preset selection in the dropdown (but do
+        # NOT re-apply it — the values in mic-effects.json already represent
+        # whatever state the user left off at, including any auto-tune drift).
+        active = _get_active_preset()
+        names = _all_preset_names()
+        if active in names:
+            self._preset_dd.set_selected(names.index(active))
+        else:
+            self._preset_dd.set_selected(0)
+        self._preset_suppress = False
+        self._update_delete_btn_state()
+
+        # Sync default-source toggle to live PipeWire state, then poll every 3s
+        self._default_suppress = False
+        self._refresh_default_state()
+        GLib.timeout_add_seconds(3, self._poll_default_state)
+
+        # Restore LIVE auto-tune state — if it was on when the app last quit,
+        # re-enable it now (which triggers _start_auto via the toggle signal).
+        if _get_mic_state_key("live_enabled", False):
+            self._auto_btn.set_active(True)
+
+    def _poll_default_state(self) -> bool:
+        self._refresh_default_state()
+        return GLib.SOURCE_CONTINUE
+
+    # ── Live auto-tune (daemon-driven; GUI reflects state) ──────────────
+    # The real loop lives in _daemon_live_auto_thread. The GUI flips the
+    # `live_enabled` flag in mic-effects.json and polls live-status.json
+    # for a compact summary line.
+
+    def _on_auto_toggled(self, btn) -> None:
+        """
+        The button just flips the `live_enabled` flag in state. The daemon's
+        live auto-tune thread picks this up on its next poll cycle (~2s) and
+        does the actual work in the background. The GUI's only job is to
+        reflect the current state and poll the daemon's status cache file
+        for live measurements.
+        """
+        active = btn.get_active()
+        _set_mic_state_key("live_enabled", active)
+        if active:
+            self._start_auto()
+        else:
+            self._stop_auto()
+
+    def _start_auto(self) -> None:
+        """Start displaying live status from the daemon (no local worker)."""
+        if self._auto_running:
+            return
+        self._auto_running = True
+        self._auto_btn.set_label("LIVE ●")
+        self._auto_btn.add_css_class("mic-live-active")
+        self._status_lbl.set_markup(
+            f'<span foreground="#888" size="x-small">● live · starting…</span>'
+        )
+        if self._live_poll_id is not None:
+            GLib.source_remove(self._live_poll_id)
+        self._live_poll_id = GLib.timeout_add(1000, self._poll_live_status)
+
+    def _stop_auto(self) -> None:
+        if not self._auto_running:
+            return
+        self._auto_running = False
+        if self._live_poll_id is not None:
+            GLib.source_remove(self._live_poll_id)
+            self._live_poll_id = None
+        self._auto_btn.set_label("LIVE")
+        self._auto_btn.remove_css_class("mic-live-active")
+        self._status_lbl.set_markup('')
+
+    def _poll_live_status(self) -> bool:
+        """Read the daemon's live-status.json and render a compact summary."""
+        if not self._auto_running:
+            return GLib.SOURCE_REMOVE
+        status = _auto_read_live_status()
+        if not status.get("running"):
+            self._status_lbl.set_markup(
+                f'<span foreground="#888" size="x-small">● live · starting…</span>'
+            )
+            return GLib.SOURCE_CONTINUE
+        if status.get("error"):
+            self._status_lbl.set_markup(
+                f'<span foreground="#ef4444" size="x-small">● live · {status["error"]}</span>'
+            )
+            return GLib.SOURCE_CONTINUE
+        if status.get("warming_up"):
+            cnt = status.get("warmup_count", 0)
+            tot = status.get("warmup_total", _AUTO_WARMUP_SAMPLES)
+            self._status_lbl.set_markup(
+                f'<span foreground="#888" size="x-small">● live · warming up ({cnt}/{tot})</span>'
+            )
+            return GLib.SOURCE_CONTINUE
+        noise = int(status.get("noise_db", 0))
+        voice_str = f'{int(status["voice_db"])}' if status.get("has_voice") else "—"
+        peak  = int(status.get("peak_db", 0))
+        base  = f'● live · noise {noise} · voice {voice_str} · peak {peak}'
+        last  = status.get("last_action")
+        cd    = status.get("cooldown_remain", 0)
+        suffix = ''
+        if last:
+            suffix = f' · ✓ {last}'
+        elif cd > 0:
+            suffix = ' · holding'
+        self._status_lbl.set_markup(
+            f'<span foreground="{_MIC_COLOR}" size="x-small">{base}{suffix}</span>'
+        )
+        return GLib.SOURCE_CONTINUE
+
+    # ── Default-source toggle ─────────────────────────────────────────────
+
+    def _refresh_default_state(self) -> None:
+        """Sync the toggle button to whether Sonar_Mic is currently the default."""
+        current = _get_default_source_name()
+        is_default = current == "Sonar_Mic"
+        self._default_suppress = True
+        self._default_btn.set_active(is_default)
+        self._default_btn.set_label(
+            "DEFAULT ✓" if is_default else "SET AS DEFAULT"
+        )
+        self._default_btn.set_tooltip_text(
+            "Processed mic is the system default — click to revert to raw HW mic"
+            if is_default
+            else "Make the processed Sonar_Mic the system default input\n"
+                 "(apps and games that can't pick a mic will use the processed one)"
+        )
+        self._default_suppress = False
+
+    def _on_default_toggled(self, btn) -> None:
+        if getattr(self, "_default_suppress", False):
+            return
+        if btn.get_active():
+            ok = _set_default_source("Sonar_Mic")
+            if not ok:
+                # Revert toggle; Sonar_Mic likely not running
+                self._default_suppress = True
+                btn.set_active(False)
+                self._default_suppress = False
+                self._status_lbl.set_markup(
+                    '<span foreground="#ef4444" size="x-small">not running</span>'
+                )
+                GLib.timeout_add(1500, self._blank_status)
+                return
+        else:
+            _set_default_source(_get_active_mic_input_target())
+        GLib.timeout_add(200, lambda: (self._refresh_default_state(), False)[1])
+
+    # ── Preset / reset / refresh ──────────────────────────────────────────
+
+    def _on_preset_selected(self, dd, _param) -> None:
+        self._update_delete_btn_state()
+        if self._preset_suppress:
+            return
+        idx = dd.get_selected()
+        names = _all_preset_names()
+        if 0 <= idx < len(names):
+            chosen = names[idx]
+            _apply_preset_by_display_name(chosen)
+            _set_active_preset(chosen)
+            self.refresh_from_json()
+            # Live auto-tune naturally stays relative to the new values since
+            # the daemon re-plans from current state each iteration using
+            # per-step caps (no stale origin to re-anchor).
+            self._schedule_reload()
+
+    def _refresh_preset_dropdown(self, select_name: str | None = None) -> None:
+        """Rebuild the preset dropdown after custom presets change."""
+        self._preset_suppress = True
+        names = _all_preset_names()
+        self._preset_model = Gtk.StringList.new(names)
+        self._preset_dd.set_model(self._preset_model)
+        if select_name and select_name in names:
+            self._preset_dd.set_selected(names.index(select_name))
+        else:
+            self._preset_dd.set_selected(0)
+        self._preset_suppress = False
+        self._update_delete_btn_state()
+
+    def _update_delete_btn_state(self) -> None:
+        idx = self._preset_dd.get_selected()
+        names = _all_preset_names()
+        if 0 <= idx < len(names) and names[idx].startswith("✦ "):
+            self._delete_btn.set_sensitive(True)
+        else:
+            self._delete_btn.set_sensitive(False)
+
+    def _on_delete_preset_clicked(self, _btn) -> None:
+        idx = self._preset_dd.get_selected()
+        names = _all_preset_names()
+        if not (0 <= idx < len(names)):
+            return
+        selected = names[idx]
+        if not selected.startswith("✦ "):
+            return
+        raw_name = selected[2:]
+        _delete_custom_preset(raw_name)
+        # Drop to "Default" and forget it as active
+        _set_active_preset("Default")
+        self._refresh_preset_dropdown(select_name="Default")
+        self._status_lbl.set_markup(
+            f'<span foreground="#888" size="x-small">deleted "{raw_name}"</span>'
+        )
+        GLib.timeout_add(1500, self._blank_status)
+
+    def _build_save_popover(self) -> None:
+        """Build the save-preset popover once, reused on every click (no leak)."""
+        self._save_pop = Gtk.Popover()
+        self._save_pop.set_parent(self._save_btn)
+        self._save_pop.set_has_arrow(True)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        box.set_margin_start(8); box.set_margin_end(8)
+
+        lbl = Gtk.Label(label="Save current mic settings as…")
+        lbl.add_css_class("dim-label")
+        box.append(lbl)
+
+        self._save_entry = Gtk.Entry()
+        self._save_entry.set_placeholder_text("preset name")
+        self._save_entry.set_width_chars(18)
+        box.append(self._save_entry)
+
+        self._save_err_lbl = Gtk.Label()
+        self._save_err_lbl.set_halign(Gtk.Align.START)
+        self._save_err_lbl.set_visible(False)
+        box.append(self._save_err_lbl)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_row.set_halign(Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda _b: self._save_pop.popdown())
+        btn_row.append(cancel)
+        save = Gtk.Button(label="Save")
+        save.add_css_class("suggested-action")
+        save.connect("clicked", self._on_save_preset_confirm)
+        btn_row.append(save)
+        box.append(btn_row)
+
+        self._save_entry.connect("activate", self._on_save_preset_confirm)
+        self._save_pop.set_child(box)
+
+    def _on_save_preset_clicked(self, _btn) -> None:
+        if not hasattr(self, "_save_pop") or self._save_pop is None:
+            self._build_save_popover()
+        self._save_entry.set_text("")
+        self._save_err_lbl.set_visible(False)
+        self._save_pop.popup()
+        self._save_entry.grab_focus()
+
+    def _on_save_preset_confirm(self, *_) -> None:
+        name = self._save_entry.get_text().strip()
+        if not name:
+            self._save_err_lbl.set_markup(
+                '<span foreground="#ef4444" size="x-small">name required</span>'
+            )
+            self._save_err_lbl.set_visible(True)
+            return
+        if name in _MIC_PRESETS:
+            self._save_err_lbl.set_markup(
+                '<span foreground="#ef4444" size="x-small">that name is built-in — pick another</span>'
+            )
+            self._save_err_lbl.set_visible(True)
+            return
+        if _save_custom_preset(name):
+            self._save_pop.popdown()
+            self._refresh_preset_dropdown(select_name=f"✦ {name}")
+            _set_active_preset(f"✦ {name}")
+            self._status_lbl.set_markup(
+                f'<span foreground="{_MIC_COLOR}" size="x-small">✓ saved "{name}"</span>'
+            )
+            GLib.timeout_add(2000, self._blank_status)
+
+    def _on_reset_clicked(self, _btn) -> None:
+        _reset_mic_effects_to_defaults()
+        _set_active_preset("Default")
+        self._preset_suppress = True
+        self._preset_dd.set_selected(0)  # "Default"
+        self._preset_suppress = False
+        self.refresh_from_json()
+        self._schedule_reload()
+
+    def refresh_from_json(self) -> None:
+        """Re-read mic-effects.json and update all widgets to match."""
+        effects = _load_mic_effects()
+
+        # Row enables
+        self._rnnoise_row.set_enabled(effects["rnnoise"]["enabled"])
+        self._gate_row.set_enabled(effects["gate"]["enabled"])
+        self._eq_row.set_enabled(effects["eq"]["enabled"])
+        self._comp_row.set_enabled(effects["compressor"]["enabled"])
+        self._limiter_row.set_enabled(effects["limiter"]["enabled"])
+
+        # Sliders (non-EQ)
+        self._setters["rnnoise.threshold"](effects["rnnoise"]["threshold"])
+        self._setters["gate.threshold_db"](effects["gate"]["threshold_db"])
+        self._setters["gate.attack"](effects["gate"]["attack"])
+        self._setters["gate.release"](effects["gate"]["release"])
+        self._setters["gate.ratio"](effects["gate"]["ratio"])
+        self._setters["compressor.threshold_db"](effects["compressor"]["threshold_db"])
+        self._setters["compressor.ratio"](effects["compressor"]["ratio"])
+        self._setters["compressor.attack"](effects["compressor"]["attack"])
+        self._setters["compressor.release"](effects["compressor"]["release"])
+        self._setters["compressor.makeup_db"](effects["compressor"]["makeup_db"])
+        self._setters["limiter.ceiling_db"](effects["limiter"]["ceiling_db"])
+
+        # EQ bands
+        self._suppress = True
+        for i, adj in enumerate(self._eq_adjs):
+            adj.set_value(effects["eq"]["bands"][i]["gain_db"])
+        self._suppress = False
+
+        # Refresh previews
+        for k in ("rnnoise", "gate", "eq", "compressor", "limiter"):
+            self._refresh_preview(k)
+
+    # ── Preview string builder (what shows on the collapsed row) ──────────
+
+    def _refresh_preview(self, effect_key: str) -> None:
+        eff = _load_mic_effects()
+        if effect_key == "rnnoise":
+            self._rnnoise_row.set_preview(f'{int(eff["rnnoise"]["threshold"])}%')
+        elif effect_key == "gate":
+            g = eff["gate"]
+            self._gate_row.set_preview(f'{int(g["threshold_db"])} dB · {g["ratio"]:.0f}:1')
+        elif effect_key == "eq":
+            non_zero = [b for b in eff["eq"]["bands"] if abs(b["gain_db"]) >= 0.5]
+            self._eq_row.set_preview(
+                "flat" if not non_zero
+                else f'{len(non_zero)} band{"s" if len(non_zero) != 1 else ""} active'
+            )
+        elif effect_key == "compressor":
+            c = eff["compressor"]
+            self._comp_row.set_preview(f'{int(c["threshold_db"])} dB · {c["ratio"]:.0f}:1')
+        elif effect_key == "limiter":
+            self._limiter_row.set_preview(f'{eff["limiter"]["ceiling_db"]:.1f} dB')
+
+    # ── Callbacks ─────────────────────────────────────────────────────────
+
+    def _on_enable(self, effect: str, active: bool) -> None:
+        _update_mic_effect(effect, "enabled", active)
+        self._refresh_preview(effect)
+        self._schedule_reload()
+
+    def _on_change(self, effect: str, key: str, value) -> None:
+        _update_mic_effect(effect, key, value)
+        self._refresh_preview(effect)
+        self._schedule_reload()
+
+    def _on_collapse_toggle(self, _btn) -> None:
+        revealed = self._revealer.get_reveal_child()
+        self._revealer.set_reveal_child(not revealed)
+        if revealed:
+            self._collapse_btn.set_icon_name("pan-end-symbolic")
+            self._collapse_btn.set_tooltip_text("Expand")
+        else:
+            self._collapse_btn.set_icon_name("pan-down-symbolic")
+            self._collapse_btn.set_tooltip_text("Collapse")
+
+    # ── Voice activity detection ──────────────────────────────────────────
+    #
+    # A background thread continuously samples the raw HW mic in short windows
+    # and maintains a flag: "is the user speaking right now". Any filter-chain
+    # reload checks this flag and defers itself until silence, so apps like
+    # Discord never hear a mid-word click from the chain restarting.
+
+    _VAD_DB_THRESHOLD  = -35.0    # RMS above this = speaking
+    _VAD_WINDOW_SEC    = 0.4      # sample window length
+    _VAD_HOLD_SEC      = 0.4      # stay "speaking" for this long after last sample
+
+    def _vad_worker(self) -> None:
+        import struct, math, time as _time
+        while not self._vad_stop_event.is_set():
+            try:
+                proc = subprocess.Popen(
+                    ["parec", "--device", _get_active_mic_input_target(),
+                     "--format=s16le", "--rate=24000", "--channels=1", "--raw"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                self._vad_stop_event.wait(timeout=2.0)
+                continue
+
+            target_bytes = int(24000 * 2 * self._VAD_WINDOW_SEC)
+            data = bytearray()
+            deadline = _time.monotonic() + self._VAD_WINDOW_SEC + 0.5
+            try:
+                while len(data) < target_bytes and _time.monotonic() < deadline:
+                    if self._vad_stop_event.is_set():
+                        break
+                    chunk = proc.stdout.read(2048)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.3)
+                except Exception:
+                    try: proc.kill()
+                    except Exception: pass
+
+            if len(data) < 2400:     # less than 50ms captured
+                self._vad_stop_event.wait(timeout=0.3)
+                continue
+
+            n = len(data) // 2
+            samples = struct.unpack(f"<{n}h", bytes(data[: n * 2]))
+            s2 = 0
+            for v in samples:
+                s2 += v * v
+            rms = math.sqrt(s2 / n)
+            db = 20 * math.log10(rms / 32768.0) if rms > 1 else -100
+
+            if db > self._VAD_DB_THRESHOLD:
+                self._currently_speaking = True
+                self._last_speech_time = _time.monotonic()
+            else:
+                # Only clear the flag if we've had silence for HOLD_SEC — prevents
+                # flapping between words.
+                if _time.monotonic() - self._last_speech_time > self._VAD_HOLD_SEC:
+                    self._currently_speaking = False
+
+            # Short pause between windows to keep CPU minimal
+            self._vad_stop_event.wait(timeout=0.1)
+
+    def _is_currently_speaking(self) -> bool:
+        import time as _time
+        if self._currently_speaking:
+            return True
+        # Safety buffer: if speech was very recent, still consider speaking
+        return (_time.monotonic() - self._last_speech_time) < self._VAD_HOLD_SEC
+
+    def _schedule_reload(self) -> None:
+        """Debounce filter-chain reloads so rapid slider drags only cause one restart."""
+        if self._reload_timeout_id is not None:
+            GLib.source_remove(self._reload_timeout_id)
+        self._reload_wait_start = 0.0
+        self._status_lbl.set_markup('<span foreground="#888" size="x-small">pending…</span>')
+        # 600 ms debounce — long enough to coalesce slider drags, short enough
+        # to feel immediate when you release the slider
+        self._reload_timeout_id = GLib.timeout_add(600, self._do_reload)
+
+    _RELOAD_SILENCE_REQUIRED_SEC = 1.5   # require this long of continuous silence
+    _RELOAD_MAX_WAIT_SEC         = 12.0  # force-apply after this even if still talking
+
+    def _do_reload(self) -> bool:
+        import time as _time
+        self._reload_timeout_id = None
+
+        now = _time.monotonic()
+        if self._reload_wait_start == 0.0:
+            self._reload_wait_start = now
+        waited = now - self._reload_wait_start
+
+        # Require sustained silence — not just "not speaking right now" but
+        # at least _RELOAD_SILENCE_REQUIRED_SEC seconds since the last voice
+        # detection. This ensures the reload happens during a real pause and
+        # the brief click during DSP restart is hidden by actual silence.
+        silence_duration = now - self._last_speech_time
+        not_yet_silent = (
+            self._is_currently_speaking()
+            or silence_duration < self._RELOAD_SILENCE_REQUIRED_SEC
+        )
+
+        if not_yet_silent and waited < self._RELOAD_MAX_WAIT_SEC:
+            self._status_lbl.set_markup(
+                '<span foreground="#888" size="x-small">waiting for silence…</span>'
+            )
+            self._reload_timeout_id = GLib.timeout_add(200, self._do_reload)
+            return GLib.SOURCE_REMOVE
+
+        self._reload_wait_start = 0.0
+
+        # Regenerate config from JSON (cheap, synchronous)
+        try:
+            _write_mic_filter_chain()
+        except Exception as e:
+            print(f"[sonar-mixer] mic filter-chain write failed: {e}", flush=True)
+            self._status_lbl.set_markup('<span foreground="#ef4444" size="x-small">error</span>')
+            return GLib.SOURCE_REMOVE
+
+        # Offload the actual restart to a worker thread so we can do the
+        # volume fade without blocking the UI. The fade masks the DSP transient
+        # that happens when the filter-chain tears down and rebuilds.
+        self._status_lbl.set_markup('<span foreground="#888" size="x-small">applying…</span>')
+        threading.Thread(target=self._silent_reload_worker, daemon=True).start()
+        return GLib.SOURCE_REMOVE
+
+    def _silent_reload_worker(self) -> None:
+        """Near-silent filter-chain restart — fades, restarts, mutes, fades back.
+        Shared with the daemon path via _silent_restart_mic_service."""
+        if _silent_restart_mic_service():
+            GLib.idle_add(self._clear_status)
+        else:
+            GLib.idle_add(lambda: (self._status_lbl.set_markup(
+                '<span foreground="#ef4444" size="x-small">error</span>'
+            ), False)[1])
+
+    def _clear_status(self) -> bool:
+        self._status_lbl.set_markup('<span foreground="#888" size="x-small">✓</span>')
+        GLib.timeout_add(1500, self._blank_status)
+        return GLib.SOURCE_REMOVE
+
+    def _blank_status(self) -> bool:
+        self._status_lbl.set_markup('')
+        return GLib.SOURCE_REMOVE
+
+
+# ---------------------------------------------------------------------------
+# Stream routing row
+# ---------------------------------------------------------------------------
+
+class StreamRow(Gtk.Box):
+    """One row in the app-routing panel: [icon] [app name]  [channel dropdown]"""
+
+    def __init__(self, stream_ids: list[int], app_name: str, current_channel: str | None,
+                 sonar_ids: dict[str, int | None],
+                 routing_prefs: dict[str, str] | None = None,
+                 media_role: str | None = None) -> None:
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.add_css_class("stream-row")
+        self._stream_ids = stream_ids
+        self._app_name = app_name
+        self._sonar_ids = sonar_ids
+        self._suppress = False
+
+        # Priority: stored user pref → detected channel (WirePlumber already routed it)
+        # → role-based default (last resort when channel is unknown)
+        if routing_prefs and app_name in routing_prefs:
+            current_channel = routing_prefs[app_name]
+        elif current_channel is None:
+            current_channel = default_channel(media_role)
+
+        self.set_margin_top(4)
+        self.set_margin_bottom(4)
+        self.set_margin_start(8)
+        self.set_margin_end(8)
+
+        name_lbl = Gtk.Label(label=app_name)
+        name_lbl.set_halign(Gtk.Align.START)
+        name_lbl.set_hexpand(False)
+        name_lbl.set_ellipsize(3)
+        name_lbl.set_max_width_chars(8)
+        name_lbl.add_css_class("stream-name")
+        self.append(name_lbl)
+
+        self._model = Gtk.StringList.new(CHANNELS)
+        self._dropdown = Gtk.DropDown(model=self._model)
+        self._dropdown.set_hexpand(True)
+        self._dropdown.add_css_class("channel-dropdown")
+
+        idx = CHANNELS.index(current_channel) if current_channel in CHANNELS else 0
+        self._suppress = True
+        self._dropdown.set_selected(idx)
+        self._suppress = False
+
+        self._apply_dropdown_color(CHANNELS[idx])
+        self._dropdown.connect("notify::selected", self._on_channel_changed)
+        self.append(self._dropdown)
+
+    def _apply_dropdown_color(self, channel: str) -> None:
+        for cls in [f"ch-{c.lower()}" for c in CHANNELS]:
+            self._dropdown.remove_css_class(cls)
+        self._dropdown.add_css_class(f"ch-{channel.lower()}")
+
+    def _on_channel_changed(self, dropdown: Gtk.DropDown, _param) -> None:
+        if self._suppress:
+            return
+        channel = CHANNELS[dropdown.get_selected()]
+        self._apply_dropdown_color(channel)
+        save_routing_pref(self._app_name, channel)
+        for sid in self._stream_ids:
+            move_stream(sid, channel)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class SonarMixerWindow(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application) -> None:
+        super().__init__(application=app)
+        self.set_title("Sonar Mixer")
+        self.set_default_size(820, 480)
+        self.set_resizable(True)
+
+        self._strips: dict[str, ChannelStrip] = {}
+        self._sonar_ids: dict[str, int | None] = {}
+        self._stream_rows: dict[str, StreamRow] = {}  # keyed by app name
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        # Header
+        header = Adw.HeaderBar()
+        header.add_css_class("flat")
+        header.set_title_widget(
+            Adw.WindowTitle(title="Sonar Mixer", subtitle="PipeWire Audio Channels")
+        )
+        refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh_btn.set_tooltip_text("Re-scan PipeWire nodes")
+        refresh_btn.connect("clicked", self._on_refresh)
+        header.pack_end(refresh_btn)
+        root.append(header)
+
+        root.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # ── Main body: strips (left) + routing sidebar (right, resizable) ─
+        body = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        body.set_vexpand(True)
+        body.set_position(620)   # default: strips get 620px, sidebar gets the rest
+
+        # Channel strips (left pane)
+        strips_scroll = Gtk.ScrolledWindow()
+        strips_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        self._strips_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self._strips_box.set_halign(Gtk.Align.CENTER)
+        self._strips_box.set_hexpand(False)
+        self._strips_box.set_valign(Gtk.Align.CENTER)
+        strips_scroll.set_child(self._strips_box)
+        body.set_start_child(strips_scroll)
+        body.set_resize_start_child(True)
+        body.set_shrink_start_child(True)
+
+        # ── App routing sidebar (collapsible, right pane) ─────────────────
+
+        routing_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        # Header row with collapse toggle
+        panel_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        panel_header.set_margin_top(8)
+        panel_header.set_margin_bottom(4)
+        panel_header.set_margin_start(8)
+        panel_header.set_margin_end(4)
+
+        panel_lbl = Gtk.Label()
+        panel_lbl.set_markup('<span foreground="#555555" size="x-small" weight="bold" letter_spacing="1200">ROUTING</span>')
+        panel_lbl.set_halign(Gtk.Align.START)
+        panel_lbl.set_hexpand(True)
+        panel_header.append(panel_lbl)
+
+        self._routing_status = Gtk.Label()
+        self._routing_status.set_markup('<span foreground="#555" size="x-small"></span>')
+        panel_header.append(self._routing_status)
+
+        self._sidebar_toggle = Gtk.Button()
+        self._sidebar_toggle.set_icon_name("pan-end-symbolic")
+        self._sidebar_toggle.add_css_class("flat")
+        self._sidebar_toggle.set_tooltip_text("Hide routing panel")
+        self._sidebar_toggle.connect("clicked", self._on_sidebar_toggle)
+        panel_header.append(self._sidebar_toggle)
+
+        routing_box.append(panel_header)
+
+        self._stream_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._empty_lbl = Gtk.Label()
+        self._empty_lbl.set_markup(
+            '<span foreground="#444" size="x-small">—</span>'
+        )
+        self._empty_lbl.set_margin_top(8)
+        self._empty_lbl.set_margin_bottom(8)
+        self._empty_lbl.set_halign(Gtk.Align.CENTER)
+        self._stream_list.append(self._empty_lbl)
+
+        self._sidebar_revealer = Gtk.Revealer()
+        self._sidebar_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_LEFT)
+        self._sidebar_revealer.set_reveal_child(True)
+        self._sidebar_revealer.set_vexpand(True)
+
+        stream_scroll = Gtk.ScrolledWindow()
+        stream_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        stream_scroll.set_vexpand(True)
+        stream_scroll.set_child(self._stream_list)
+        self._sidebar_revealer.set_child(stream_scroll)
+        routing_box.append(self._sidebar_revealer)
+
+        body.set_end_child(routing_box)
+        body.set_resize_end_child(False)
+        body.set_shrink_end_child(True)
+        root.append(body)
+
+        root.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # ── ChatMix ───────────────────────────────────────────────────────
+        self._chatmix = ChatMixStrip()
+        root.append(self._chatmix)
+
+        root.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        self._mic_effects = MicEffectsPanel()
+        root.append(self._mic_effects)
+
+        # Wrap everything in a scrolled window so the window never grows past
+        # the monitor size — if content overflows, the whole UI scrolls.
+        outer_scroll = Gtk.ScrolledWindow()
+        outer_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        outer_scroll.set_propagate_natural_height(True)
+        outer_scroll.set_child(root)
+
+        self.set_content(outer_scroll)
+        self.connect("map", self._on_window_mapped)
+
+        self._populate()
+        self._start_hw_chatmix()
+
+        GLib.timeout_add_seconds(5, self._sync_volumes)
+        GLib.timeout_add(1500, self._sync_streams)   # 1.5 s — fast enough to win
+
+    # ── Hardware ChatMix wheel ────────────────────────────────────────────
+
+    def _start_hw_chatmix(self) -> None:
+        """Start a background thread that reads ChatMix HID events from the headset."""
+        t = threading.Thread(target=self._hw_chatmix_loop, daemon=True)
+        t.start()
+
+    def _hw_chatmix_loop(self) -> None:
+        """Read report 0x45 from Arctis Nova 7 hidraw and push updates to UI."""
+        try:
+            import hid
+        except ImportError:
+            return
+
+        VENDOR_ID  = 0x1038
+        PRODUCT_ID = 0x22a1
+        TARGET_INTERFACE = 5   # usage_page 0xFF00, sends ChatMix reports
+
+        while True:
+            try:
+                devs = hid.enumerate(VENDOR_ID, PRODUCT_ID)
+                target = next((d for d in devs if d['interface_number'] == TARGET_INTERFACE), None)
+                if target is None:
+                    import time; time.sleep(5); continue
+
+                with hid.Device(path=target['path']) as dev:
+                    import time
+                    # Read initial wheel position via feature report
+                    try:
+                        init = dev.get_feature_report(0x45, 64)
+                        if init and len(init) >= 3 and init[0] == 0x45:
+                            GLib.idle_add(self._chatmix.set_from_hw, init[1], init[2])
+                    except Exception:
+                        pass
+
+                    dev.nonblocking = True
+                    last = None
+                    while True:
+                        data = dev.read(64)
+                        if data and len(data) >= 3 and data[0] == 0x45:
+                            game_val = data[1]
+                            chat_val = data[2]
+                            if (game_val, chat_val) != last:
+                                last = (game_val, chat_val)
+                                GLib.idle_add(self._chatmix.set_from_hw, game_val, chat_val)
+                        time.sleep(0.01)
+            except Exception:
+                import time; time.sleep(3)
+
+    # ── Populate (full rebuild) ───────────────────────────────────────────
+
+    def _populate(self) -> None:
+        while (c := self._strips_box.get_first_child()):
+            self._strips_box.remove(c)
+        self._strips.clear()
+
+        status = _run(["wpctl", "status"])
+        self._sonar_ids = parse_ids(status)
+
+        for i, ch in enumerate(CHANNELS):
+            if i > 0:
+                sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+                sep.set_margin_top(12)
+                sep.set_margin_bottom(12)
+                self._strips_box.append(sep)
+            strip = ChannelStrip(ch, self._sonar_ids.get(ch))
+            self._strips[ch] = strip
+            self._strips_box.append(strip)
+
+        # Thick divider before Mic
+        div = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        div.set_margin_top(0)
+        div.set_margin_bottom(0)
+        div.set_margin_start(6)
+        div.set_margin_end(6)
+        div.add_css_class("input-divider")
+        self._strips_box.append(div)
+
+        mic = ChannelStrip("Mic", self._sonar_ids.get("Mic"))
+        self._strips["Mic"] = mic
+        self._strips_box.append(mic)
+
+        self._chatmix.set_channel_ids(
+            self._sonar_ids.get("Game"),
+            self._sonar_ids.get("Chat"),
+            game_strip=self._strips.get("Game"),
+            chat_strip=self._strips.get("Chat"),
+        )
+
+        self._rebuild_streams()
+
+    # ── Stream list ───────────────────────────────────────────────────────
+
+    def _rebuild_streams(self, streams: list | None = None) -> None:
+        if streams is None:
+            streams = get_active_streams(self._sonar_ids)
+
+        routing_prefs = load_routing_prefs()
+
+        # Group per-stream tuples by app name, preserving first-seen order.
+        # groups: app_name → list of (sid, detected_channel, media_role)
+        groups: dict[str, list[tuple]] = {}
+        for sid, name, detected_channel, media_role in streams:
+            groups.setdefault(name, []).append((sid, detected_channel, media_role))
+
+        # Enforce saved preferences only — never override WirePlumber's routing
+        # for apps the user has not explicitly configured.
+        for name, entries in groups.items():
+            if name in routing_prefs:
+                preferred = routing_prefs[name]
+                for sid, detected_channel, _role in entries:
+                    if preferred != detected_channel:
+                        move_stream(sid, preferred)
+
+        while (c := self._stream_list.get_first_child()):
+            self._stream_list.remove(c)
+        self._stream_rows.clear()
+
+        if not groups:
+            self._stream_list.append(self._empty_lbl)
+            self._routing_status.set_markup('<span foreground="#555" size="x-small"></span>')
+            return
+
+        for i, (name, entries) in enumerate(groups.items()):
+            if i > 0:
+                sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+                sep.set_margin_start(14)
+                sep.set_margin_end(14)
+                sep.set_opacity(0.3)
+                self._stream_list.append(sep)
+
+            # Use the channel and role from the first stream in the group.
+            first_channel = entries[0][1]
+            first_role    = entries[0][2]
+            sids = [e[0] for e in entries]
+
+            row = StreamRow(sids, name, first_channel, self._sonar_ids, routing_prefs, first_role)
+            self._stream_rows[name] = row
+            self._stream_list.append(row)
+
+        n = len(groups)
+        self._routing_status.set_markup(
+            f'<span foreground="#555" size="x-small">{n} app{"s" if n != 1 else ""}</span>'
+        )
+
+    def _sync_streams(self) -> bool:
+        streams = get_active_streams(self._sonar_ids)
+
+        # Compare the flat set of all stream IDs currently displayed against
+        # what PipeWire reports.  Any appearance or disappearance triggers a
+        # full rebuild (which also handles app-name re-grouping).
+        displayed_ids: set[int] = set()
+        for row in self._stream_rows.values():
+            displayed_ids.update(row._stream_ids)
+        new_ids = {s[0] for s in streams}
+
+        if displayed_ids != new_ids:
+            self._rebuild_streams(streams)
+        else:
+            # Only enforce routing for apps the user has explicitly configured.
+            routing_prefs = load_routing_prefs()
+            for sid, name, detected_channel, _media_role in streams:
+                if name in routing_prefs:
+                    preferred = routing_prefs[name]
+                    if preferred != detected_channel:
+                        move_stream(sid, preferred)
+
+        return GLib.SOURCE_CONTINUE
+
+    def _sync_volumes(self) -> bool:
+        chatmix_centered = self._chatmix.is_centered()
+        for name, strip in self._strips.items():
+            # Don't overwrite Game/Chat strips from pactl when chatmix is active —
+            # pactl holds scaled values, but the strip should show user-intended volume.
+            if not chatmix_centered and name in ("Game", "Chat"):
+                continue
+            strip.refresh()
+        return GLib.SOURCE_CONTINUE
+
+    def _on_sidebar_toggle(self, _btn) -> None:
+        revealed = self._sidebar_revealer.get_reveal_child()
+        self._sidebar_revealer.set_reveal_child(not revealed)
+        if revealed:
+            self._sidebar_toggle.set_icon_name("pan-start-symbolic")
+            self._sidebar_toggle.set_tooltip_text("Show routing panel")
+        else:
+            self._sidebar_toggle.set_icon_name("pan-end-symbolic")
+            self._sidebar_toggle.set_tooltip_text("Hide routing panel")
+
+    def _on_window_mapped(self, _win) -> None:
+        """Clamp the window's default size to the current monitor's geometry."""
+        try:
+            surface = self.get_surface()
+            if surface is None:
+                return
+            display = surface.get_display()
+            monitor = display.get_monitor_at_surface(surface)
+            if monitor is None:
+                return
+            geom = monitor.get_geometry()
+            # Leave some margin for titlebar/panels
+            max_w = max(600, geom.width  - 80)
+            max_h = max(400, geom.height - 120)
+            cur_w, cur_h = self.get_default_size()
+            new_w = min(cur_w if cur_w > 0 else max_w, max_w)
+            new_h = min(cur_h if cur_h > 0 else max_h, max_h)
+            if (new_w, new_h) != (cur_w, cur_h):
+                self.set_default_size(new_w, new_h)
+        except Exception as e:
+            print(f"[sonar-mixer] monitor clamp failed: {e}", flush=True)
+
+    def _on_refresh(self, _btn) -> None:
+        self._chatmix.reset()
+        self._populate()
+
+
+# ---------------------------------------------------------------------------
+# CSS
+# ---------------------------------------------------------------------------
+
+def _build_css() -> bytes:
+    accents = "\n".join(
+        f".accent-{n.lower()} {{ background-color: {m['color']}; border-radius: 0; }}"
+        for n, m in CHANNEL_META.items()
+    )
+    # Per-channel colored slider fill — the key visual improvement
+    channel_highlights = "\n".join(
+        f".channel-{n.lower()} scale.vertical trough highlight"
+        f" {{ background-color: {m['color']}; }}"
+        for n, m in CHANNEL_META.items()
+    )
+    dropdown_tints = "\n".join(
+        f".ch-{n.lower()} {{ color: {m['color']}; }}"
+        for n, m in CHANNEL_META.items()
+        if n != "Mic"
+    )
+
+    return f"""
+    window {{
+        background-color: #161616;
+    }}
+
+    headerbar.flat {{
+        background: transparent;
+        border-bottom: 1px solid alpha(white, 0.06);
+    }}
+
+    /* ── Channel sliders ── */
+    .channel-strip scale.vertical trough {{
+        min-width: 2px;
+        border-radius: 2px;
+        background-color: alpha(white, 0.09);
+        margin: 0 8px;
+    }}
+    .channel-strip scale.vertical trough highlight {{
+        border-radius: 2px;
+        background-color: alpha(white, 0.3);
+    }}
+    .channel-strip scale.vertical slider {{
+        min-height: 16px;
+        min-width: 16px;
+        border-radius: 8px;
+        background-color: #dedede;
+        border: none;
+        box-shadow: 0 1px 5px alpha(black, 0.6);
+    }}
+    .channel-strip scale marks mark indicator {{
+        min-height: 0;
+        min-width: 0;
+        opacity: 0;
+    }}
+
+    /* Per-channel fill colors */
+    {channel_highlights}
+
+    /* Accent bar */
+    {accents}
+
+    /* Volume % */
+    .vol-label {{
+        font-size: 12px;
+        font-family: monospace;
+        opacity: 0.85;
+        margin-bottom: 2px;
+    }}
+
+    /* Mute button */
+    .mute-btn {{
+        padding: 3px 0;
+        border-radius: 4px;
+        border: 1px solid alpha(white, 0.1);
+        background: transparent;
+        opacity: 0.5;
+        margin: 0 8px 10px 8px;
+        min-height: 0;
+    }}
+    .mute-btn:hover {{
+        opacity: 1;
+        background: alpha(white, 0.05);
+    }}
+    .mute-btn.muted {{
+        background-color: alpha(#ef4444, 0.15);
+        color: #ef4444;
+        border-color: alpha(#ef4444, 0.4);
+        opacity: 1;
+    }}
+
+    /* Divider between output channels and mic */
+    .input-divider {{
+        min-width: 1px;
+        background-color: alpha(white, 0.07);
+        margin-top: 16px;
+        margin-bottom: 16px;
+    }}
+
+    /* Section headers */
+    .section-label {{
+        font-size: x-small;
+        font-weight: bold;
+        letter-spacing: 1px;
+        color: alpha(white, 0.3);
+    }}
+
+    /* App routing rows */
+    .stream-row {{
+        border-radius: 6px;
+        padding: 1px 4px;
+    }}
+    .stream-row:hover {{
+        background-color: alpha(white, 0.04);
+    }}
+    .stream-name {{
+        font-size: small;
+        color: alpha(white, 0.75);
+    }}
+
+    /* Channel dropdown */
+    .channel-dropdown {{
+        font-size: x-small;
+        font-weight: bold;
+        padding: 2px 4px;
+        border-radius: 5px;
+    }}
+
+    /* ChatMix horizontal slider */
+    scale.horizontal trough {{
+        min-height: 2px;
+        border-radius: 2px;
+        background-color: alpha(white, 0.09);
+    }}
+    scale.horizontal trough highlight {{
+        border-radius: 2px;
+        background-color: alpha(white, 0.25);
+    }}
+    scale.horizontal slider {{
+        min-height: 14px;
+        min-width: 14px;
+        border-radius: 7px;
+        background-color: #dedede;
+        border: none;
+        box-shadow: 0 1px 4px alpha(black, 0.5);
+    }}
+    scale.horizontal marks mark indicator {{
+        min-height: 0;
+        min-width: 0;
+        opacity: 0;
+    }}
+
+    /* ── Mic effects panel ─────────────────────────────────────────── */
+
+    .mic-effects {{ padding: 0; }}
+
+    /* Collapsible effect row header — flat button styling */
+    .mic-row-header {{
+        background: none;
+        border: none;
+        box-shadow: none;
+        padding: 4px 4px;
+        border-radius: 4px;
+        min-height: 0;
+    }}
+    .mic-row-header:hover {{
+        background-color: alpha(white, 0.04);
+    }}
+
+    /* Slider rows inside an effect body */
+    .mic-slider-row {{
+        padding: 1px 0;
+    }}
+    .mic-slider-label {{
+        font-size: x-small;
+        color: alpha(white, 0.55);
+    }}
+    .mic-slider-value {{
+        font-family: monospace;
+    }}
+    .mic-slider trough {{
+        min-height: 2px;
+    }}
+    .mic-slider slider {{
+        min-height: 11px;
+        min-width: 11px;
+        border-radius: 6px;
+        background-color: #c0c0c0;
+        box-shadow: 0 1px 3px alpha(black, 0.5);
+    }}
+
+    /* Live auto-tune toggle */
+    .mic-live-toggle {{
+        font-size: x-small;
+        font-weight: bold;
+        letter-spacing: 1px;
+        padding: 2px 8px;
+        border-radius: 4px;
+        min-height: 0;
+        border: 1px solid alpha(white, 0.15);
+        color: alpha(white, 0.6);
+    }}
+    .mic-live-toggle:hover {{
+        background-color: alpha(white, 0.06);
+    }}
+    .mic-live-toggle:checked,
+    .mic-live-toggle.mic-live-active {{
+        background-color: alpha(#3b82f6, 0.22);
+        color: #3b82f6;
+        border-color: alpha(#3b82f6, 0.5);
+    }}
+    .mic-live-toggle:checked:hover,
+    .mic-live-toggle.mic-live-active:hover {{
+        background-color: alpha(#3b82f6, 0.32);
+    }}
+
+    /* Default-source toggle button */
+    .mic-default-toggle {{
+        font-size: x-small;
+        font-weight: bold;
+        letter-spacing: 1px;
+        padding: 2px 8px;
+        border-radius: 4px;
+        min-height: 0;
+        border: 1px solid alpha(white, 0.15);
+        color: alpha(white, 0.6);
+    }}
+    .mic-default-toggle:checked {{
+        background-color: alpha({_MIC_COLOR}, 0.22);
+        color: {_MIC_COLOR};
+        border-color: alpha({_MIC_COLOR}, 0.5);
+    }}
+    .mic-default-toggle:hover {{
+        background-color: alpha(white, 0.06);
+    }}
+    .mic-default-toggle:checked:hover {{
+        background-color: alpha({_MIC_COLOR}, 0.32);
+    }}
+
+    /* Compact EQ band sliders */
+    .mic-eq-band trough {{
+        min-width: 2px;
+        margin: 0 6px;
+    }}
+    .mic-eq-band trough highlight {{
+        background-color: {_MIC_COLOR};
+    }}
+    .mic-eq-band slider {{
+        min-height: 10px;
+        min-width: 10px;
+        border-radius: 5px;
+        background-color: #c0c0c0;
+        box-shadow: 0 1px 2px alpha(black, 0.5);
+    }}
+    .mic-eq-band marks mark indicator {{
+        opacity: 0.15;
+        background-color: white;
+    }}
+
+    {dropdown_tints}
+    """.encode()
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+class SonarMixerApp(Adw.Application):
+    def __init__(self) -> None:
+        super().__init__(application_id="io.github.sonar-mixer")
+        self.connect("activate", self._on_activate)
+
+    def _on_activate(self, app) -> None:
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(_build_css())
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+        SonarMixerWindow(app).present()
+
+
+def main() -> int:
+    return SonarMixerApp().run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

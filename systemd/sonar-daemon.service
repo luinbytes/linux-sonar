@@ -1,0 +1,13 @@
+[Unit]
+Description=Sonar routing daemon
+Documentation=man:pipewire(1)
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/sonar-mixer --daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

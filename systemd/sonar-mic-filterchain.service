@@ -1,0 +1,21 @@
+[Unit]
+Description=Sonar Mic filter-chain subprocess (SteelSeries Sonar-style mic effects)
+Documentation=man:pipewire(1)
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+BindsTo=pipewire.service
+# Be generous with restart rate — live param updates trigger many restarts
+StartLimitBurst=50
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+# Make sure the config file exists before trying to start pipewire with it
+ExecStartPre=%h/.local/bin/sonar-mixer --write-mic-config
+ExecStart=/usr/bin/pipewire -c %h/.config/sonar-mixer/mic-filter-chain.conf
+Restart=always
+RestartSec=1
+Slice=session.slice
+
+[Install]
+WantedBy=default.target
