@@ -22,6 +22,12 @@ mkdir -p "$HOME/.config/pipewire/pipewire.conf.d"
 install -m 644 "$REPO_DIR/config/pipewire/10-sonar-sinks.conf" \
     "$HOME/.config/pipewire/pipewire.conf.d/10-sonar-sinks.conf"
 
+# These creation-time targets must be set by Pulse before WirePlumber links them.
+say "Installing PipeWire-Pulse stream routing config"
+mkdir -p "$HOME/.config/pipewire/pipewire-pulse.conf.d"
+install -m 644 "$REPO_DIR/config/pipewire/60-sonar-stream-routing.conf" \
+    "$HOME/.config/pipewire/pipewire-pulse.conf.d/60-sonar-routing.conf"
+
 # ── 3. WirePlumber default routing ──────────────────────────────────────
 say "Installing WirePlumber routing config"
 mkdir -p "$HOME/.config/wireplumber/wireplumber.conf.d"
