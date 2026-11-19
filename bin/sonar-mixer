@@ -830,6 +830,9 @@ context.spa-libs = {{
   support.*       = support/libspa-support
 }}
 context.modules = [
+  {{ name = libpipewire-module-rt
+    args = {{ nice.level = -11 rt.prio = 88 }}
+    flags = [ ifexists nofail ] }}
   {{ name = libpipewire-module-protocol-native }}
   {{ name = libpipewire-module-client-node }}
   {{ name = libpipewire-module-adapter }}
@@ -942,10 +945,20 @@ def _chatmix_daemon_thread(sonar_ids_ref: list) -> None:
                     if data and len(data) >= 3 and data[0] == 0x45:
                         game_val, chat_val = data[1], data[2]
                         if (game_val, chat_val) != last:
+                            was_center = last is None or last == (100, 100)
                             last = (game_val, chat_val)
                             ids = sonar_ids_ref[0]
                             game_id = ids.get("Game")
                             chat_id = ids.get("Chat")
+
+                            # Leaving center: the live volumes are the truth
+                            # (they may have been changed outside the GUI via
+                            # wpctl/pavucontrol/bar scroll), so snapshot them as
+                            # the base instead of trusting a stale file.
+                            if was_center and (game_val, chat_val) != (100, 100):
+                                cur_game = get_volume(game_id)[0] if game_id else 1.0
+                                cur_chat = get_volume(chat_id)[0] if chat_id else 1.0
+                                _save_chatmix_base(cur_game, cur_chat)
 
                             # Re-read base file on every event so live strip
                             # slider changes are picked up without restarting.
