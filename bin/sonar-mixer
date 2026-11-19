@@ -50,23 +50,30 @@ def parse_ids(status: str) -> dict[str, int | None]:
     ):
         ids[m.group(2).replace("Sonar_", "")] = int(m.group(1))
 
-    # Mic: search only inside the Sources block
-    src_lines, in_audio, in_src = [], False, False
+    in_audio, section, physical_mic = False, None, None
     for line in status.splitlines():
-        s = line.strip()
-        if s == "Audio":       in_audio = True
-        elif s == "Video":     in_audio = False
-        if in_audio and "Sources:" in line:  in_src = True
-        elif in_src and "Filters:" in line:  break
-        if in_src: src_lines.append(line)
-    # Prefer our noise-cancelled virtual mic; fall back to physical QuadCast
-    m = re.search(r"^\s.*?\*?\s+(\d+)\.\s+Sonar_Mic\b",
-                  "\n".join(src_lines), re.MULTILINE)
-    if not m:
-        m = re.search(r"^\s.*?\*?\s+(\d+)\.\s+HyperX QuadCast",
-                      "\n".join(src_lines), re.MULTILINE)
-    if m:
-        ids["Mic"] = int(m.group(1))
+        if line and not line[0].isspace():
+            in_audio = line == "Audio"
+            section = None
+        if not in_audio:
+            continue
+        s = line.strip(" \t│├└─")
+        if s.endswith(":"):
+            section = s[:-1]
+        if section not in ("Sources", "Filters"):
+            continue
+        if section == "Sources":
+            m = re.match(r"\*?\s*(\d+)\.\s+HyperX QuadCast", s)
+            if m and physical_mic is None:
+                physical_mic = int(m.group(1))
+        elif "[Audio/Source]" not in s:
+            continue
+        m = re.match(r"\*?\s*(\d+)\.\s+Sonar_Mic(?=\s*(?:\[|$))", s)
+        if m:
+            ids["Mic"] = int(m.group(1))
+            break
+    if ids["Mic"] is None:
+        ids["Mic"] = physical_mic
     return ids
 
 
@@ -153,6 +160,15 @@ def _resolve_app_name(props: dict) -> str:
     pid = props.get("application.process.id")
 
     if binary in ("electron", "electron40") and pid:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().decode("utf-8", errors="replace").split("\x00")
+            equibop_config = str(Path.home() / ".config" / "equibop")
+            if f"--user-data-dir={equibop_config}" in args:
+                return "Equibop"
+        except (OSError, ValueError):
+            pass
+
         try:
             with open(f"/proc/{pid}/status") as f:
                 for line in f:
@@ -312,9 +328,10 @@ _MIC_CHAIN_CONF   = Path.home() / ".config" / "sonar-mixer" / "mic-filter-chain.
 # which updates _state.mic_input and restarts the subprocess.
 _MIC_INPUT_TARGETS: dict[str, str] = {
     "hyperx": "alsa_input.usb-Kingston_HyperX_Quadcast_4110-00.analog-stereo",
+    "hyperx_mono": "sonar_hyperx_mono",
     "arctis": "alsa_input.usb-SteelSeries_Arctis_Nova_7-00.mono-fallback",
 }
-_MIC_INPUT_DEFAULT = "hyperx"
+_MIC_INPUT_DEFAULT = "hyperx_mono"
 
 
 def _get_active_mic_input_key() -> str:
@@ -323,7 +340,27 @@ def _get_active_mic_input_key() -> str:
 
 
 def _get_active_mic_input_target() -> str:
-    return _MIC_INPUT_TARGETS[_get_active_mic_input_key()]
+    key = _get_active_mic_input_key()
+    if key == "hyperx_mono":
+        _ensure_hyperx_mono_source()
+    return _MIC_INPUT_TARGETS[key]
+
+
+def _ensure_hyperx_mono_source() -> None:
+    """Expose the HyperX as a mono source so voice apps cannot fold stereo badly."""
+    source_name = _MIC_INPUT_TARGETS["hyperx_mono"]
+    if source_name in _run(["pactl", "list", "short", "sources"]):
+        return
+    _run([
+        "pactl", "load-module", "module-remap-source",
+        f"master={_MIC_INPUT_TARGETS['hyperx']}",
+        f"source_name={source_name}",
+        "source_properties=device.description=HyperX QuadCast Mono",
+        "channels=1",
+        "channel_map=mono",
+        "master_channel_map=front-left",
+        "remix=no",
+    ])
 
 
 # Back-compat alias used by the VAD and auto-tune workers (they sample from
@@ -793,6 +830,9 @@ context.spa-libs = {{
   support.*       = support/libspa-support
 }}
 context.modules = [
+  {{ name = libpipewire-module-rt
+    args = {{ nice.level = -11 rt.prio = 88 }}
+    flags = [ ifexists nofail ] }}
   {{ name = libpipewire-module-protocol-native }}
   {{ name = libpipewire-module-client-node }}
   {{ name = libpipewire-module-adapter }}
@@ -807,9 +847,11 @@ context.modules = [
       audio.channels = 2
       audio.position = [ FL FR ]
       capture.props = {{
-        node.name     = "Sonar_Mic_in"
-        node.passive  = true
-        target.object = "{mic_target}"
+        node.name      = "Sonar_Mic_in"
+        node.passive   = true
+        target.object  = "{mic_target}"
+        audio.channels = 2
+        audio.position = [ FL FR ]
       }}
       playback.props = {{
         node.name     = "Sonar_Mic"
@@ -832,6 +874,35 @@ def _write_mic_filter_chain() -> None:
         _MIC_CHAIN_CONF.write_text(_build_mic_filter_chain_conf())
     except Exception as e:
         print(f"[sonar-mixer] failed to write mic filter-chain conf: {e}", flush=True)
+
+
+class _LegacyHidDevice:
+    """Context-manager adapter for hidapi builds exposing hid.device()."""
+
+    def __init__(self, dev) -> None:
+        self._dev = dev
+
+    def __enter__(self):
+        return self._dev
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._dev.close()
+
+
+def _open_hid_path(hid_module, path):
+    if hasattr(hid_module, "Device"):
+        return hid_module.Device(path=path)
+
+    dev = hid_module.device()
+    dev.open_path(path)
+    return _LegacyHidDevice(dev)
+
+
+def _set_hid_nonblocking(dev, enabled: bool) -> None:
+    if hasattr(dev, "set_nonblocking"):
+        dev.set_nonblocking(1 if enabled else 0)
+    else:
+        dev.nonblocking = enabled
 
 
 def _chatmix_daemon_thread(sonar_ids_ref: list) -> None:
@@ -857,7 +928,7 @@ def _chatmix_daemon_thread(sonar_ids_ref: list) -> None:
                 time.sleep(5)
                 continue
 
-            with hid.Device(path=target['path']) as dev:
+            with _open_hid_path(hid, target['path']) as dev:
                 # Read initial position via feature report
                 try:
                     init = dev.get_feature_report(0x45, 64)
@@ -866,7 +937,7 @@ def _chatmix_daemon_thread(sonar_ids_ref: list) -> None:
                 except Exception:
                     pass
 
-                dev.nonblocking = True
+                _set_hid_nonblocking(dev, True)
                 print("[sonar-daemon] ChatMix HID connected", flush=True)
 
                 while True:
@@ -874,10 +945,20 @@ def _chatmix_daemon_thread(sonar_ids_ref: list) -> None:
                     if data and len(data) >= 3 and data[0] == 0x45:
                         game_val, chat_val = data[1], data[2]
                         if (game_val, chat_val) != last:
+                            was_center = last is None or last == (100, 100)
                             last = (game_val, chat_val)
                             ids = sonar_ids_ref[0]
                             game_id = ids.get("Game")
                             chat_id = ids.get("Chat")
+
+                            # Leaving center: the live volumes are the truth
+                            # (they may have been changed outside the GUI via
+                            # wpctl/pavucontrol/bar scroll), so snapshot them as
+                            # the base instead of trusting a stale file.
+                            if was_center and (game_val, chat_val) != (100, 100):
+                                cur_game = get_volume(game_id)[0] if game_id else 1.0
+                                cur_chat = get_volume(chat_id)[0] if chat_id else 1.0
+                                _save_chatmix_base(cur_game, cur_chat)
 
                             # Re-read base file on every event so live strip
                             # slider changes are picked up without restarting.
@@ -1300,11 +1381,25 @@ def _run_daemon() -> int:
     live_auto_thread.start()
 
     print("[sonar-daemon] sinks ready, enforcing routing prefs", flush=True)
+    # The full pass (pw-dump + /proc lookups) only runs when the sink-input
+    # list (ids + current sink), the prefs, or the Sonar ids change, for two
+    # ticks after each change, and at least every 15 s as a retry net.
+    last_sig, settle, last_full = None, 0, 0.0
     while running:
         status = _run(["wpctl", "status"])
         sonar_ids = parse_ids(status)
         sonar_ids_ref[0] = sonar_ids
         routing_prefs = load_routing_prefs()
+        sig = (_run(["pactl", "list", "short", "sink-inputs"]),
+               sorted(routing_prefs.items()), sorted(sonar_ids.items()))
+        if sig != last_sig:
+            last_sig, settle = sig, 2
+        now = time.monotonic()
+        if settle == 0 and now - last_full < 15.0:
+            time.sleep(1.5)
+            continue
+        settle = max(0, settle - 1)
+        last_full = now
         if routing_prefs:
             for sid, name, detected_channel, _role in get_active_streams(sonar_ids):
                 if name in routing_prefs:
@@ -1349,36 +1444,15 @@ if "--set-mic-input" in sys.argv:
     _set_mic_state_key("mic_input", name)
     _write_mic_filter_chain()
 
-    # Try live relink first.
-    new_target = _MIC_INPUT_TARGETS[name]
-    _live_relinked = False
-    try:
-        _so_raw = subprocess.run(
-            ["pactl", "list", "source-outputs"],
-            capture_output=True, text=True, timeout=2,
-        ).stdout
-        _so_id = None
-        for _line in _so_raw.splitlines():
-            if _line.startswith("Source Output #"):
-                _so_id = _line.split("#")[1].strip()
-            elif '"Sonar_Mic_in"' in _line and _so_id is not None:
-                break
-        else:
-            _so_id = None
-        if _so_id is not None:
-            _r = subprocess.run(
-                ["pactl", "move-source-output", _so_id, new_target],
-                capture_output=True, timeout=2,
-            )
-            _live_relinked = _r.returncode == 0
-    except Exception:
-        pass
-
-    if _live_relinked:
-        print(f"mic input → {name}")
-        sys.exit(0)
-
-    # Fallback: restart the service (Sonar_Mic_in not found or move failed).
+    # Always restart the service so the filter-chain is re-instantiated with
+    # the correct format for the new source.  Live-relink via
+    # pactl move-source-output caused SEGV crashes in RnNoiseStereo::process()
+    # because audioconvert reconfigured the channel count mid-stream (mono
+    # Arctis → stereo HyperX or vice-versa), producing an invalid sample_count
+    # stride for the already-instantiated stereo plugin.
+    #
+    # Sonar_Mic has object.linger = true, so it stays visible in the graph
+    # during the ~1 s restart window — Discord's source-output survives.
     try:
         subprocess.run(
             ["systemctl", "--user", "reset-failed", "sonar-mic-filterchain.service"],
@@ -1676,20 +1750,20 @@ class ChatMixStrip(Gtk.Box):
         if _CHATMIX_BASE_FILE.exists():
             file_game, file_chat = _load_chatmix_base()
         else:
-            file_game = game_strip._adj.get_value() if game_strip else 1.0
-            file_chat = chat_strip._adj.get_value() if chat_strip else 1.0
+            file_game = game_strip._adj.get_value() if game_strip and game_strip._adj is not None else 1.0
+            file_chat = chat_strip._adj.get_value() if chat_strip and chat_strip._adj is not None else 1.0
             _save_chatmix_base(file_game, file_chat)
         self._base_game = file_game
         self._base_chat = file_chat
         # Correct the strip display to show user-intended volume, not the
         # WirePlumber-persisted chatmix-scaled value.
-        if game_strip:
+        if game_strip and game_strip._adj is not None:
             game_strip._suppress = True
             game_strip._adj.set_value(self._base_game)
             game_strip._update_pct(self._base_game)
             game_strip._suppress = False
             game_strip._chatmix_ref = self
-        if chat_strip:
+        if chat_strip and chat_strip._adj is not None:
             chat_strip._suppress = True
             chat_strip._adj.set_value(self._base_chat)
             chat_strip._update_pct(self._base_chat)
@@ -3020,7 +3094,7 @@ class SonarMixerWindow(Adw.ApplicationWindow):
                 if target is None:
                     import time; time.sleep(5); continue
 
-                with hid.Device(path=target['path']) as dev:
+                with _open_hid_path(hid, target['path']) as dev:
                     import time
                     # Read initial wheel position via feature report
                     try:
@@ -3030,7 +3104,7 @@ class SonarMixerWindow(Adw.ApplicationWindow):
                     except Exception:
                         pass
 
-                    dev.nonblocking = True
+                    _set_hid_nonblocking(dev, True)
                     last = None
                     while True:
                         data = dev.read(64)
@@ -3141,6 +3215,11 @@ class SonarMixerWindow(Adw.ApplicationWindow):
         )
 
     def _sync_streams(self) -> bool:
+        status = _run(["wpctl", "status"])
+        if status and parse_ids(status) != self._sonar_ids:
+            self._populate()
+            return GLib.SOURCE_CONTINUE
+
         streams = get_active_streams(self._sonar_ids)
 
         # Compare the flat set of all stream IDs currently displayed against
